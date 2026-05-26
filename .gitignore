@@ -1,0 +1,10 @@
+﻿__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+build/
+_build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake

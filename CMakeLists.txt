@@ -4,7 +4,7 @@ project(MucusPlugNavigator)
 
 #-----------------------------------------------------------------------------
 # Extension meta-information
-set(EXTENSION_HOMEPAGE "https://github.com/YOUR_GITHUB_NAME/MucusPlugNavigator")
+set(EXTENSION_HOMEPAGE "https://github.com/XavierLBH/MucusPlugNavigator")
 set(EXTENSION_CONTRIBUTORS "Bohua Liu")
 set(EXTENSION_DESCRIPTION "A 3D Slicer extension for lung CT mucus plug navigation, editing, counting, and scoring.")
 set(EXTENSION_ICONURL "")

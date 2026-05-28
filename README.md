@@ -1,37 +1,47 @@
-# MucusPlugNavigator
+# Mucus Plug Navigator
 
-MucusPlugNavigator is a 3D Slicer extension for reviewing mucus plug segmentations in lung CT images.
+`MucusPlugNavigator` is a 3D Slicer scripted module for the updated mucus plug workflow.
+It does not split, extract, or run connected components. Every existing segment in the
+selected segmentation node is treated as one mucus plug.
 
-## Purpose
+## What It Adds
 
-This extension helps users inspect and manage existing mucus plug segments in a selected 3D Slicer segmentation. Each segment is treated as one mucus plug.
+- Embeds Slicer's standard `qMRMLSegmentEditorWidget`
+- Reuses normal Segment Editor behavior, with visible editing controls limited to No editing, Paint, and Erase
+- Adds `Jump`, `Last`, `Next`, and `Delete` controls
+- Shows `Mucus plug count: N`
+- Calculates current segment `Volume` and `Length` only when `Measure` is clicked
+- Exports all mucus plug segment measurements to a CSV file
+- Jumps slice views to the selected segment center
+- Applies an adjustable jump zoom factor from `1x` to `10x`
+- Places `Add`, `Show 3D`, `Delete`, `Measure`, `No editing`, `Paint`, `Erase`, and `Export CSV` together in one custom toolbar row
 
-## Main Features
+## Development Loading
 
-- Select a mucus plug segmentation
-- Select a CT source volume
-- Count mucus plug segments
-- Jump to the selected mucus plug segment
-- Move to the previous or next mucus plug segment
-- Adjust jump zoom for easier inspection of small mucus plugs
-- Add a new segment
-- Delete the selected mucus plug segment
-- Toggle 3D display
-- Use embedded Segment Editor tools
-- Paint and erase the selected segment
-- Measure the selected segment volume and length in pixels
+In 3D Slicer:
 
-## Current Version
+1. Open `Edit > Application Settings > Modules`.
+2. Add this module path to additional module paths:
+   `MucusPlugNavigator`
+3. Restart Slicer or use the Developer Tools reload workflow.
+4. Open `Mucus Plug Navigator` under the `Segmentation` category.
 
-This version focuses on navigation and editing of existing mucus plug segments.
+## Use
 
-It does not yet support room-based mucus scoring or parent lung-room assignment.
-
-## Requirements
-
-- 3D Slicer
-- Segment Editor module
-
-## Developer
-
-Bohua Liu
+1. Load the CT volume.
+2. Load the mucus segmentation.
+3. In `Mucus Plug Navigator`, choose:
+   - `Segmentation`: the mucus segmentation node
+   - `Source volume`: the CT volume node
+4. Use Segment Editor normally.
+5. Use:
+   - `Jump` to center and zoom to the selected segment
+   - `Last` to move to the previous segment in segmentation order
+   - `Next` to move to the next segment in segmentation order
+   - `Delete` to delete only the selected segment after confirmation
+   - `Measure` to calculate volume and length for the selected segment
+   - `Export CSV` to save all segment names, volumes, and lengths
+6. Use the visible Segment Editor effect buttons for:
+   - `No editing`
+   - `Paint`
+   - `Erase`

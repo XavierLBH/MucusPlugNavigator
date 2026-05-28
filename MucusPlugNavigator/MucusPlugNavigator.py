@@ -25,6 +25,9 @@ JUMP_ZOOM_DECIMALS = 1
 JUMP_ZOOM_STEP = 0.5
 JUMP_ZOOM_DEFAULT = 1.0
 
+
+EXPORT_MASK_MIN_VOLUME_PIXELS = 100000
+
 ROW_MARGINS = (0, 4, 0, 4)
 GRID_HORIZONTAL_SPACING = 6
 GRID_VERTICAL_SPACING = 4
@@ -230,7 +233,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.eraseButton = self._createButton("Erase", "Activate the Segment Editor Erase effect.")
         segmentToolbarLayout.addWidget(self.eraseButton, 1, 2)
 
-        self.exportButton = self._createButton("Export CSV", "Export segment name, volume, and length for all mucus plugs to a CSV file.")
+        self.exportButton = self._createButton("Export", "Export segment name, volume, and length for all mucus plugs to a CSV file.")
         segmentToolbarLayout.addWidget(self.exportButton, 1, 3)
 
         self.layout.addWidget(segmentToolbarFrame)
@@ -664,8 +667,11 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
         self._setExportInProgress(True)
         try:
-            self._writeMeasurementsCsv(filePath, segmentationNode)
-            slicer.util.infoDisplay("Exported mucus plug measurements to:\n{}".format(filePath))
+            exportedCount, skippedCount = self._writeMeasurementsCsv(filePath, segmentationNode)
+            message = "Exported {} mucus plug measurements to:\n{}".format(exportedCount, filePath)
+            if skippedCount:
+                message += "\n\nSkipped {} large mask-like segment(s).".format(skippedCount)
+            slicer.util.infoDisplay(message)
         except Exception as exc:
             logging.exception("Failed to export mucus plug measurements")
             slicer.util.errorDisplay("Failed to export mucus plug measurements:\n{}".format(exc))
@@ -702,7 +708,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
     def _writeMeasurementsCsv(self, filePath, segmentationNode):
         """Write the measurement CSV using the requested count and per-segment rows."""
-        rows = self.logic.mucusPlugMeasurementRows(segmentationNode, self.sourceVolumeNode())
+        rows, skippedRows = self.logic.exportMucusPlugMeasurementRows(segmentationNode, self.sourceVolumeNode())
         with open(filePath, "w", newline="") as csvFile:
             writer = csv.writer(csvFile)
             writer.writerow(["Mucus plug count", len(rows)])
@@ -710,6 +716,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             writer.writerow(["Segment", "Volume", "Length"])
             for row in rows:
                 writer.writerow([row["segmentName"], row["volumePixels"], row["lengthPixels"]])
+        return len(rows), len(skippedRows)
 
     def jumpToSegment(self, segmentID):
         """Center slice views on a segment and apply the current jump zoom."""
@@ -831,7 +838,7 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
         """Return the number of mucus plug segments in the selected segmentation."""
         return len(self.segmentIDs(segmentationNode))
 
-    def mucusPlugMeasurementRows(self, segmentationNode, referenceVolumeNode=None):
+    def mucusPlugMeasurementRows(self, segmentationNode, referenceVolumeNode=None, skipLengthAbovePixels=None):
         """Return CSV-ready measurement rows for every segment in segmentation order."""
         rows = []
         if not segmentationNode:
@@ -841,7 +848,12 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
         for segmentID in self.segmentIDs(segmentationNode):
             segment = segmentation.GetSegment(segmentID) if segmentation else None
             segmentName = segment.GetName() if segment else segmentID
-            metrics = self.segmentVoxelMetrics(segmentationNode, segmentID, referenceVolumeNode)
+            metrics = self.segmentVoxelMetrics(
+                segmentationNode,
+                segmentID,
+                referenceVolumeNode,
+                skipLengthAbovePixels,
+            )
             rows.append(
                 {
                     "segmentID": segmentID,
@@ -852,7 +864,30 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
             )
         return rows
 
-    def segmentVoxelMetrics(self, segmentationNode, segmentID, referenceVolumeNode=None):
+    def exportMucusPlugMeasurementRows(self, segmentationNode, referenceVolumeNode=None):
+        """Return export rows after removing large mask-like segments from the CSV output."""
+        rows = self.mucusPlugMeasurementRows(
+            segmentationNode,
+            referenceVolumeNode,
+            skipLengthAbovePixels=EXPORT_MASK_MIN_VOLUME_PIXELS,
+        )
+        exportRows = []
+        skippedRows = []
+        for row in rows:
+            if self._isMaskLikeExportRow(row):
+                skippedRows.append(row)
+            else:
+                exportRows.append(row)
+        return exportRows, skippedRows
+
+    def _isMaskLikeExportRow(self, row):
+        """Return True when an export row looks like a whole-mask segment instead of a mucus plug."""
+        try:
+            return int(row["volumePixels"]) >= EXPORT_MASK_MIN_VOLUME_PIXELS
+        except Exception:
+            return False
+
+    def segmentVoxelMetrics(self, segmentationNode, segmentID, referenceVolumeNode=None, skipLengthAbovePixels=None):
         """Calculate voxel count and main-axis pixel length for one segment."""
         if not self.isValidSegmentID(segmentationNode, segmentID):
             return None
@@ -860,37 +895,44 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
         try:
             import numpy as np
 
-            occupiedVoxelCoordinates = self._occupiedVoxelCoordinates(
+            segmentArray = self._segmentArray(
                 segmentationNode,
                 segmentID,
                 referenceVolumeNode,
-                np,
             )
+            occupiedMask = segmentArray != 0
+            volumePixels = int(np.count_nonzero(occupiedMask))
         except Exception:
             logging.exception("Could not compute segment voxel measurements for segment: %s", segmentID)
             return None
 
-        volumePixels = int(occupiedVoxelCoordinates.shape[0])
         if volumePixels == 0:
             return {"volumePixels": 0, "lengthPixels": 0}
         if volumePixels == 1:
             return {"volumePixels": volumePixels, "lengthPixels": 1}
+        if skipLengthAbovePixels is not None and volumePixels >= skipLengthAbovePixels:
+            return {"volumePixels": volumePixels, "lengthPixels": ""}
 
+        occupiedVoxelCoordinates = np.argwhere(occupiedMask)
         lengthPixels = self._principalAxisLengthPixels(occupiedVoxelCoordinates, np)
         return {"volumePixels": volumePixels, "lengthPixels": max(lengthPixels, 1)}
 
-    def _occupiedVoxelCoordinates(self, segmentationNode, segmentID, referenceVolumeNode, np):
-        """Convert a segment labelmap into nonzero voxel coordinates."""
+    def _segmentArray(self, segmentationNode, segmentID, referenceVolumeNode):
+        """Return a binary labelmap array for one segment, using the source volume when needed."""
         try:
-            segmentArray = slicer.util.arrayFromSegmentBinaryLabelmap(segmentationNode, segmentID)
+            return slicer.util.arrayFromSegmentBinaryLabelmap(segmentationNode, segmentID)
         except Exception:
             if not referenceVolumeNode:
                 raise
-            segmentArray = slicer.util.arrayFromSegmentBinaryLabelmap(
+            return slicer.util.arrayFromSegmentBinaryLabelmap(
                 segmentationNode,
                 segmentID,
                 referenceVolumeNode,
             )
+
+    def _occupiedVoxelCoordinates(self, segmentationNode, segmentID, referenceVolumeNode, np):
+        """Convert a segment labelmap into nonzero voxel coordinates."""
+        segmentArray = self._segmentArray(segmentationNode, segmentID, referenceVolumeNode)
         return np.argwhere(segmentArray != 0)
 
     def _principalAxisLengthPixels(self, occupiedVoxelCoordinates, np):

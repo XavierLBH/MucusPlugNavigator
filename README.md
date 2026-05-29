@@ -14,7 +14,6 @@ selected segmentation node is treated as one mucus plug.
 - Exports all mucus plug segment measurements to a CSV file
 - Jumps slice views to the selected segment center
 - Applies an adjustable jump zoom factor from `1x` to `10x`
-- Places `Add`, `Show 3D`, `Delete`, `Measure`, `No editing`, `Paint`, `Erase`, and `Export CSV` together in one custom toolbar row
 
 ## Development Loading
 
@@ -24,7 +23,7 @@ In 3D Slicer:
 2. Add this module path to additional module paths:
    `MucusPlugNavigator`
 3. Restart Slicer or use the Developer Tools reload workflow.
-4. Open `Mucus Plug Navigator` under the `Segmentation` category.
+4. Open `Mucus Plug Navigator` under the `Module` category.
 
 ## Use
 

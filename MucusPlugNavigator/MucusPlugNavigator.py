@@ -703,7 +703,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             self.exportButton.setText("Exporting...")
             slicer.app.processEvents()
         else:
-            self.exportButton.setText("Export CSV")
+            self.exportButton.setText("Export")
             self.updateSegmentCountAndButtons()
 
     def _writeMeasurementsCsv(self, filePath, segmentationNode):

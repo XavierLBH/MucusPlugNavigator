@@ -77,9 +77,12 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
         self._observedSegmentation = None
         self._segmentationObserverTags = []
+        self._observedDisplayNode = None
+        self._displayNodeObserverTags = []
         self._sliceBaseFieldOfViewByID = {}
         self._segmentEditorAddButton = None
         self._segmentEditorShow3DButton = None
+        self._suppressAutoJump = False
 
         self._initializeWidgetReferences()
 
@@ -99,6 +102,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
     def cleanup(self):
         """Release observers and Segment Editor view hooks when Slicer unloads the module."""
         self._removeSegmentationObservers()
+        self._removeSegmentationDisplayObservers()
         if self.segmentEditorWidget:
             self.segmentEditorWidget.setActiveEffect(None)
             self.segmentEditorWidget.removeViewObservations()
@@ -136,6 +140,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
         self.addButton = None
         self.show3DButton = None
+        self.visibilityButton = None
         self.deleteButton = None
         self.measureButton = None
         self.noEditingButton = None
@@ -195,6 +200,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
         self.jumpButton = self._createButton("Jump", "Jump slice views to the currently selected mucus plug.")
         controlsLayout.addWidget(self.jumpButton, 1, 2)
+        self._hideBackupJumpButton()
 
         self.lastButton = self._createButton("Last", "Select the previous segment in segmentation order and jump to it.")
         controlsLayout.addWidget(self.lastButton, 1, 3)
@@ -218,11 +224,14 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.show3DButton = self._createButton("Show 3D", "Toggle 3D display for the selected segmentation.")
         segmentToolbarLayout.addWidget(self.show3DButton, 0, 1)
 
+        self.visibilityButton = self._createButton("Hide Seg", "Toggle whole segmentation visibility in 2D and 3D.")
+        segmentToolbarLayout.addWidget(self.visibilityButton, 0, 2)
+
         self.deleteButton = self._createButton("Delete", "Delete only the currently selected mucus plug segment.")
-        segmentToolbarLayout.addWidget(self.deleteButton, 0, 2)
+        segmentToolbarLayout.addWidget(self.deleteButton, 0, 3)
 
         self.measureButton = self._createButton("Measure", "Calculate volume and length for the currently selected mucus plug.")
-        segmentToolbarLayout.addWidget(self.measureButton, 0, 3)
+        segmentToolbarLayout.addWidget(self.measureButton, 0, 4)
 
         self.noEditingButton = self._createButton("No editing", "Turn off the active Segment Editor effect.")
         segmentToolbarLayout.addWidget(self.noEditingButton, 1, 0)
@@ -257,6 +266,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.nextButton.connect("clicked(bool)", self.onNextButton)
         self.addButton.connect("clicked(bool)", self.onAddButton)
         self.show3DButton.connect("clicked(bool)", self.onShow3DButton)
+        self.visibilityButton.connect("clicked(bool)", self.onSegmentationVisibilityButton)
         self.deleteButton.connect("clicked(bool)", self.onDeleteButton)
         self.measureButton.connect("clicked(bool)", self.onMeasureButton)
         self.noEditingButton.connect("clicked(bool)", self.onNoEditingButton)
@@ -292,6 +302,11 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         button = qt.QPushButton(text)
         button.setToolTip(toolTip)
         return button
+
+    def _hideBackupJumpButton(self):
+        """Keep the manual Jump button in code as a backup, but hide it from the normal UI."""
+        if self.jumpButton:
+            self.jumpButton.hide()
 
     def _configureGridLayout(self, layout):
         """Apply the module's compact grid spacing to a layout."""
@@ -356,6 +371,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
         self._copyButtonIconSize(addButton, self.addButton)
         self._copyButtonIconSize(show3DButton, self.show3DButton)
+        self._copyButtonIconSize(show3DButton if show3DButton else addButton, self.visibilityButton)
         self._copyButtonIconSize(removeButton if removeButton else addButton, self.deleteButton)
         self._copyButtonIconSize(addButton, self.measureButton)
         self._copyButtonIconSize(noneButton if noneButton else addButton, self.noEditingButton)
@@ -472,6 +488,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             self.nextButton,
             self.addButton,
             self.show3DButton,
+            self.visibilityButton,
             self.deleteButton,
             self.measureButton,
             self.noEditingButton,
@@ -526,9 +543,11 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.updateSegmentCountAndButtons()
 
     def onCurrentSegmentChanged(self, segmentID):
-        """Clear stale measurements and refresh buttons when the active segment changes."""
+        """Clear stale measurements, refresh buttons, and auto-jump after user segment clicks."""
         self.resetCurrentSegmentMeasurements()
         self.updateSegmentCountAndButtons()
+        if not self._suppressAutoJump and self.logic.isValidSegmentID(self.segmentationNode(), segmentID):
+            self.jumpToSegment(segmentID)
 
     def onObservedSegmentationChanged(self, caller=None, event=None):
         """Refresh the UI when segments are added, removed, reordered, or modified."""
@@ -556,7 +575,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         previousSegmentID = self.logic.previousSegmentID(segmentationNode, self.currentSegmentID(), wrap=True)
         if not previousSegmentID:
             return
-        self.segmentEditorWidget.setCurrentSegmentID(previousSegmentID)
+        self._setCurrentSegmentIDWithoutAutoJump(previousSegmentID)
         self.jumpToSegment(previousSegmentID)
         self.updateSegmentCountAndButtons()
 
@@ -566,19 +585,19 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         nextSegmentID = self.logic.nextSegmentID(segmentationNode, self.currentSegmentID(), wrap=True)
         if not nextSegmentID:
             return
-        self.segmentEditorWidget.setCurrentSegmentID(nextSegmentID)
+        self._setCurrentSegmentIDWithoutAutoJump(nextSegmentID)
         self.jumpToSegment(nextSegmentID)
         self.updateSegmentCountAndButtons()
 
     def onAddButton(self, checked=False):
         """Add a segment using Segment Editor behavior, with a direct fallback."""
         if self._segmentEditorAddButton:
-            self._segmentEditorAddButton.click()
+            self._runWithoutAutoJump(self._segmentEditorAddButton.click)
         else:
             segmentationNode = self.segmentationNode()
             if segmentationNode:
                 segmentID = segmentationNode.GetSegmentation().AddEmptySegment()
-                self.segmentEditorWidget.setCurrentSegmentID(segmentID)
+                self._setCurrentSegmentIDWithoutAutoJump(segmentID)
         self.updateSegmentCountAndButtons()
 
     def onShow3DButton(self, checked=False):
@@ -594,6 +613,15 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         displayNode = segmentationNode.GetDisplayNode()
         if displayNode and hasattr(displayNode, "SetVisibility3D"):
             displayNode.SetVisibility3D(not displayNode.GetVisibility3D())
+
+    def onSegmentationVisibilityButton(self, checked=False):
+        """Toggle the selected segmentation visibility in both 2D and 3D views."""
+        segmentationNode = self.segmentationNode()
+        if not segmentationNode:
+            return
+        visible = not self.logic.isSegmentationVisible(segmentationNode)
+        self.logic.setSegmentationVisible(segmentationNode, visible)
+        self.updateSegmentCountAndButtons()
 
     def onDeleteButton(self, checked=False):
         """Delete only the current segment after user confirmation."""
@@ -615,7 +643,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             return
 
         nextSegmentID = self.logic.deleteSegmentAndGetNearby(segmentationNode, segmentID)
-        self.segmentEditorWidget.setCurrentSegmentID(nextSegmentID if nextSegmentID else "")
+        self._setCurrentSegmentIDWithoutAutoJump(nextSegmentID if nextSegmentID else "")
         self.updateSegmentCountAndButtons()
         if nextSegmentID:
             self.jumpToSegment(nextSegmentID)
@@ -724,7 +752,6 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         if not self.logic.isValidSegmentID(segmentationNode, segmentID):
             return
         self.logic.ensureSourceVolumeVisible(self.sourceVolumeNode())
-        self.logic.ensureSegmentationVisible(segmentationNode)
         self.logic.jumpToSegment(
             segmentationNode,
             segmentID,
@@ -758,7 +785,9 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
         self.addButton.enabled = hasSegmentation
         self.show3DButton.enabled = hasSegmentation
+        self.visibilityButton.enabled = hasSegmentation
         self.noEditingButton.enabled = hasSegmentation
+        self._updateSegmentationVisibilityButtonText()
 
         self.jumpButton.enabled = hasSegments
         self.lastButton.enabled = hasSegments
@@ -784,11 +813,42 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         if self.logic.isValidSegmentID(segmentationNode, currentSegmentID):
             return
         segmentIDs = self.logic.segmentIDs(segmentationNode)
-        self.segmentEditorWidget.setCurrentSegmentID(segmentIDs[0] if segmentIDs else "")
+        self._setCurrentSegmentIDWithoutAutoJump(segmentIDs[0] if segmentIDs else "")
+
+    def _setCurrentSegmentIDWithoutAutoJump(self, segmentID):
+        """Select a segment from module code without triggering the auto-jump handler."""
+        def setCurrentSegment():
+            """Set the Segment Editor current segment."""
+            self.segmentEditorWidget.setCurrentSegmentID(segmentID)
+
+        self._runWithoutAutoJump(setCurrentSegment)
+
+    def _runWithoutAutoJump(self, callback):
+        """Run a small operation while temporarily suppressing selection-change auto-jump."""
+        previousSuppressAutoJump = self._suppressAutoJump
+        self._suppressAutoJump = True
+        try:
+            callback()
+        finally:
+            self._suppressAutoJump = previousSuppressAutoJump
+
+    def _updateSegmentationVisibilityButtonText(self):
+        """Update the whole-segmentation visibility button text to match the display state."""
+        if not self.visibilityButton:
+            return
+        segmentationNode = self.segmentationNode()
+        if not segmentationNode:
+            self.visibilityButton.setText("Hide Seg")
+            return
+        if self.logic.isSegmentationVisible(segmentationNode):
+            self.visibilityButton.setText("Hide Seg")
+        else:
+            self.visibilityButton.setText("Show Seg")
 
     def _observeSegmentation(self, segmentationNode):
         """Observe segment changes so count and button state stay current."""
         self._removeSegmentationObservers()
+        self._removeSegmentationDisplayObservers()
         if not segmentationNode:
             return
 
@@ -808,6 +868,8 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             tag = segmentation.AddObserver(event, self.onObservedSegmentationChanged)
             self._segmentationObserverTags.append(tag)
 
+        self._observeSegmentationDisplayNode(segmentationNode)
+
     def _removeSegmentationObservers(self):
         """Remove VTK observers from the previously selected segmentation."""
         if self._observedSegmentation:
@@ -815,6 +877,28 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
                 self._observedSegmentation.RemoveObserver(tag)
         self._observedSegmentation = None
         self._segmentationObserverTags = []
+
+    def _observeSegmentationDisplayNode(self, segmentationNode):
+        """Observe display-node visibility changes so the custom visibility button stays current."""
+        segmentationNode.CreateDefaultDisplayNodes()
+        displayNode = segmentationNode.GetDisplayNode()
+        if not displayNode:
+            return
+        self._observedDisplayNode = displayNode
+        tag = displayNode.AddObserver(vtk.vtkCommand.ModifiedEvent, self.onObservedSegmentationDisplayChanged)
+        self._displayNodeObserverTags.append(tag)
+
+    def _removeSegmentationDisplayObservers(self):
+        """Remove VTK observers from the previously selected segmentation display node."""
+        if self._observedDisplayNode:
+            for tag in self._displayNodeObserverTags:
+                self._observedDisplayNode.RemoveObserver(tag)
+        self._observedDisplayNode = None
+        self._displayNodeObserverTags = []
+
+    def onObservedSegmentationDisplayChanged(self, caller=None, event=None):
+        """Refresh visibility controls when the segmentation display node changes."""
+        self.updateSegmentCountAndButtons()
 
 
 #
@@ -1076,6 +1160,31 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
 
         for compositeNode in slicer.util.getNodesByClass("vtkMRMLSliceCompositeNode"):
             compositeNode.SetBackgroundVolumeID(sourceVolumeNode.GetID())
+
+    def isSegmentationVisible(self, segmentationNode):
+        """Return True when the segmentation display node is globally visible."""
+        if not segmentationNode:
+            return False
+        segmentationNode.CreateDefaultDisplayNodes()
+        displayNode = segmentationNode.GetDisplayNode()
+        if not displayNode:
+            return False
+        return bool(displayNode.GetVisibility())
+
+    def setSegmentationVisible(self, segmentationNode, visible):
+        """Set whole-segmentation visibility in both 2D and 3D views."""
+        if not segmentationNode:
+            return
+        segmentationNode.CreateDefaultDisplayNodes()
+        displayNode = segmentationNode.GetDisplayNode()
+        if not displayNode:
+            return
+        displayNode.SetVisibility(bool(visible))
+        if hasattr(displayNode, "SetVisibility2D"):
+            displayNode.SetVisibility2D(bool(visible))
+        if hasattr(displayNode, "SetVisibility3D"):
+            displayNode.SetVisibility3D(bool(visible))
+        displayNode.Modified()
 
     def ensureSegmentationVisible(self, segmentationNode):
         """Ensure the segmentation overlay is visible in 2D and globally visible."""

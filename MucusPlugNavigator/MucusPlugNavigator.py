@@ -1,4 +1,5 @@
 import csv
+import json
 import logging
 
 import qt
@@ -15,6 +16,12 @@ from slicer.util import VTKObservationMixin
 
 SEGMENT_EDITOR_SINGLETON_TAG = "MucusPlugNavigatorSegmentEditor"
 SEGMENT_EDITOR_NODE_NAME = "MucusPlugNavigatorSegmentEditor"
+MODULE_NAME = "MucusPlugNavigator"
+MODULE_TITLE = "Mucus Plug Navigator"
+LOGICALLY_DELETED_SEGMENTS_ATTRIBUTE = "MucusPlugNavigator.LogicallyDeletedSegmentIDs"
+DELETED_BACKUP_NODE_ATTRIBUTE = "MucusPlugNavigator.DeletedBackupNodeID"
+DELETED_BACKUP_SOURCE_ATTRIBUTE = "MucusPlugNavigator.DeletedBackupSourceNodeID"
+DELETED_SEGMENT_COLOR_ATTRIBUTE_PREFIX = "MucusPlugNavigator.DeletedSegmentColor."
 
 BUTTON_MINIMUM_WIDTH = 92
 BUTTON_MINIMUM_HEIGHT = 32
@@ -75,7 +82,10 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.segmentEditorNode = None
         self.segmentEditorWidget = None
         self.visibilityShortcut = None
+        self.lastShortcut = None
+        self.nextShortcut = None
 
+        self._moduleIsActive = False
         self._observedSegmentation = None
         self._segmentationObserverTags = []
         self._observedDisplayNode = None
@@ -98,12 +108,14 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self._buildActionToolbarSection()
         self._buildEmbeddedSegmentEditorSection()
         self._createVisibilityShortcut()
+        self._createNavigationShortcuts()
         self._connectSignals()
         self._initializeWidgetState()
 
     def cleanup(self):
         """Release observers and Segment Editor view hooks when Slicer unloads the module."""
         self._removeVisibilityShortcut()
+        self._removeNavigationShortcuts()
         self._removeSegmentationObservers()
         self._removeSegmentationDisplayObservers()
         if self.segmentEditorWidget:
@@ -114,8 +126,10 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
     def enter(self):
         """Install Segment Editor view hooks when the module becomes active."""
+        self._moduleIsActive = True
         if self.visibilityShortcut:
             self.visibilityShortcut.enabled = True
+        self._setNavigationShortcutsEnabled(True)
         if self.segmentEditorWidget:
             self.segmentEditorWidget.setMRMLScene(slicer.mrmlScene)
             self.segmentEditorWidget.setupViewObservations()
@@ -124,8 +138,10 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
     def exit(self):
         """Remove Segment Editor view hooks when the user leaves the module."""
+        self._moduleIsActive = False
         if self.visibilityShortcut:
             self.visibilityShortcut.enabled = False
+        self._setNavigationShortcutsEnabled(False)
         if self.segmentEditorWidget:
             self.segmentEditorWidget.setActiveEffect(None)
             self.segmentEditorWidget.removeViewObservations()
@@ -149,6 +165,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.show3DButton = None
         self.visibilityButton = None
         self.deleteButton = None
+        self.restoreButton = None
         self.measureButton = None
         self.noEditingButton = None
         self.paintButton = None
@@ -231,7 +248,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.show3DButton = self._createButton("Show 3D", "Toggle 3D display for the selected segmentation.")
         segmentToolbarLayout.addWidget(self.show3DButton, 0, 1)
 
-        self.visibilityButton = self._createButton("Hide Seg", "Toggle whole segmentation visibility in 2D and 3D. Shortcut: Space.")
+        self.visibilityButton = self._createButton("Hide Seg", "Toggle whole segmentation visibility in 2D and 3D. Shortcut: H.")
         segmentToolbarLayout.addWidget(self.visibilityButton, 0, 2)
 
         self.deleteButton = self._createButton("Delete", "Delete only the currently selected mucus plug segment.")
@@ -251,6 +268,9 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
         self.exportButton = self._createButton("Export", "Export segment name, volume, and length for all mucus plugs to a CSV file.")
         segmentToolbarLayout.addWidget(self.exportButton, 1, 3)
+
+        self.restoreButton = self._createButton("Restore", "Choose logically deleted mucus plug segments to show again.")
+        segmentToolbarLayout.addWidget(self.restoreButton, 1, 4)
 
         self.layout.addWidget(segmentToolbarFrame)
 
@@ -275,6 +295,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.show3DButton.connect("clicked(bool)", self.onShow3DButton)
         self.visibilityButton.connect("clicked(bool)", self.onSegmentationVisibilityButton)
         self.deleteButton.connect("clicked(bool)", self.onDeleteButton)
+        self.restoreButton.connect("clicked(bool)", self.onRestoreButton)
         self.measureButton.connect("clicked(bool)", self.onMeasureButton)
         self.noEditingButton.connect("clicked(bool)", self.onNoEditingButton)
         self.paintButton.connect("clicked(bool)", self.onPaintButton)
@@ -311,15 +332,65 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         return button
 
     def _createVisibilityShortcut(self):
-        """Bind the Space key to the whole-segmentation visibility button."""
-        shortcutParent = self.parent if self.parent else slicer.util.mainWindow()
+        """Bind the H key to the whole-segmentation visibility button."""
+        shortcutParent = slicer.util.mainWindow() if slicer.util.mainWindow() else self.parent
         self.visibilityShortcut = qt.QShortcut(shortcutParent)
-        self.visibilityShortcut.setKey(qt.QKeySequence("Space"))
+        self.visibilityShortcut.setKey(self._visibilityShortcutKeySequence())
         self.visibilityShortcut.setContext(qt.Qt.ApplicationShortcut)
+        if hasattr(self.visibilityShortcut, "setAutoRepeat"):
+            self.visibilityShortcut.setAutoRepeat(False)
         self.visibilityShortcut.connect("activated()", self.onSegmentationVisibilityShortcut)
+        self.visibilityShortcut.connect("activatedAmbiguously()", self.onSegmentationVisibilityShortcut)
+
+    def _createNavigationShortcuts(self):
+        """Bind Left and Right Arrow keys to the Last and Next navigation buttons."""
+        shortcutParent = slicer.util.mainWindow() if slicer.util.mainWindow() else self.parent
+        self.lastShortcut = self._createShortcut(shortcutParent, qt.Qt.Key_Left, "Left", self.onLastShortcut)
+        self.nextShortcut = self._createShortcut(shortcutParent, qt.Qt.Key_Right, "Right", self.onNextShortcut)
+
+    def _createShortcut(self, parent, key, fallbackText, callback):
+        """Create an application-level shortcut for one keyboard action."""
+        shortcut = qt.QShortcut(parent)
+        shortcut.setKey(self._keySequence(key, fallbackText))
+        shortcut.setContext(qt.Qt.ApplicationShortcut)
+        if hasattr(shortcut, "setAutoRepeat"):
+            shortcut.setAutoRepeat(False)
+        shortcut.connect("activated()", callback)
+        shortcut.connect("activatedAmbiguously()", callback)
+        return shortcut
+
+    def _setNavigationShortcutsEnabled(self, enabled):
+        """Enable or disable arrow-key navigation shortcuts together."""
+        for shortcut in (self.lastShortcut, self.nextShortcut):
+            if shortcut:
+                shortcut.enabled = enabled
+
+    def _removeNavigationShortcuts(self):
+        """Disable and delete arrow-key navigation shortcuts during cleanup."""
+        for shortcut in (self.lastShortcut, self.nextShortcut):
+            if not shortcut:
+                continue
+            shortcut.enabled = False
+            try:
+                shortcut.deleteLater()
+            except Exception:
+                logging.debug("Could not delete navigation shortcut cleanly", exc_info=True)
+        self.lastShortcut = None
+        self.nextShortcut = None
+
+    def _visibilityShortcutKeySequence(self):
+        """Return an H key sequence that works across different Qt builds."""
+        return self._keySequence(qt.Qt.Key_H, "H")
+
+    def _keySequence(self, key, fallbackText=None):
+        """Return a key sequence from a Qt key code, with an optional text fallback."""
+        try:
+            return qt.QKeySequence(key)
+        except Exception:
+            return qt.QKeySequence(fallbackText if fallbackText else "")
 
     def _removeVisibilityShortcut(self):
-        """Disable and delete the Space shortcut so reloads do not leave duplicate bindings."""
+        """Disable and delete the H shortcut so reloads do not leave duplicate bindings."""
         if not self.visibilityShortcut:
             return
         self.visibilityShortcut.enabled = False
@@ -328,6 +399,78 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         except Exception:
             logging.debug("Could not delete visibility shortcut cleanly", exc_info=True)
         self.visibilityShortcut = None
+
+    def _visibilityShortcutBlockingReason(self):
+        """Return a short user-facing reason when H cannot toggle visibility."""
+        if not self._isModuleActiveForShortcut():
+            return "H shortcut ignored because Mucus Plug Navigator is not active."
+        if self._focusWidgetAcceptsTypedShortcut():
+            return "H shortcut ignored because a text field is active."
+        if not self.segmentationNode():
+            return "H shortcut cannot hide/show segmentation: no segmentation is selected."
+        if not self.visibilityButton:
+            return "H shortcut cannot hide/show segmentation: visibility button is not ready."
+        if not self.visibilityButton.enabled:
+            return "H shortcut cannot hide/show segmentation: visibility button is disabled."
+        return ""
+
+    def _navigationShortcutBlockingReason(self):
+        """Return a short user-facing reason when arrow keys cannot navigate mucus plugs."""
+        if not self._isModuleActiveForShortcut():
+            return "Arrow shortcut ignored because Mucus Plug Navigator is not active."
+        if self._focusWidgetAcceptsTypedShortcut():
+            return "Arrow shortcut ignored because a text field is active."
+        if not self.segmentationNode():
+            return "Arrow shortcut cannot navigate: no segmentation is selected."
+        if self.logic.activeSegmentCount(self.segmentationNode()) == 0:
+            return "Arrow shortcut cannot navigate: no mucus plug segments are available."
+        return ""
+
+
+    def _isModuleActiveForShortcut(self):
+        """Return True when this module should respond to the visibility shortcut."""
+        if self._moduleIsActive:
+            return True
+        try:
+            if self.parent and self.parent.isVisible():
+                return True
+        except Exception:
+            pass
+        try:
+            selectedModule = slicer.util.selectedModule()
+            return selectedModule in (MODULE_NAME, MODULE_TITLE)
+        except Exception:
+            return False
+
+    def _focusWidgetAcceptsTypedShortcut(self):
+        """Return True when H should be left for a focused text-editing widget."""
+        try:
+            focusWidget = qt.QApplication.focusWidget()
+        except Exception:
+            return False
+        if not focusWidget:
+            return False
+        try:
+            className = str(focusWidget.metaObject().className())
+        except Exception:
+            className = focusWidget.__class__.__name__
+        return className in ("QLineEdit", "QTextEdit", "QPlainTextEdit")
+
+    def _showShortcutMessage(self, message):
+        """Show shortcut diagnostics in Slicer's status bar, with logging as fallback."""
+        try:
+            slicer.util.showStatusMessage(message, 3000)
+            return
+        except Exception:
+            pass
+        try:
+            mainWindow = slicer.util.mainWindow()
+            if mainWindow and mainWindow.statusBar():
+                mainWindow.statusBar().showMessage(message, 3000)
+                return
+        except Exception:
+            pass
+        logging.warning(message)
 
     def _hideBackupJumpButton(self):
         """Keep the manual Jump button in code as a backup, but hide it from the normal UI."""
@@ -399,6 +542,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self._copyButtonIconSize(show3DButton, self.show3DButton)
         self._copyButtonIconSize(show3DButton if show3DButton else addButton, self.visibilityButton)
         self._copyButtonIconSize(removeButton if removeButton else addButton, self.deleteButton)
+        self._copyButtonIconSize(addButton, self.restoreButton)
         self._copyButtonIconSize(addButton, self.measureButton)
         self._copyButtonIconSize(noneButton if noneButton else addButton, self.noEditingButton)
         self._copyButtonIconSize(paintButton if paintButton else addButton, self.paintButton)
@@ -516,6 +660,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             self.show3DButton,
             self.visibilityButton,
             self.deleteButton,
+            self.restoreButton,
             self.measureButton,
             self.noEditingButton,
             self.paintButton,
@@ -572,7 +717,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         """Clear stale measurements, refresh buttons, and auto-jump after user segment clicks."""
         self.resetCurrentSegmentMeasurements()
         self.updateSegmentCountAndButtons()
-        if not self._suppressAutoJump and self.logic.isValidSegmentID(self.segmentationNode(), segmentID):
+        if not self._suppressAutoJump and self.logic.isActiveSegmentID(self.segmentationNode(), segmentID):
             self.jumpToSegment(segmentID)
 
     def onObservedSegmentationChanged(self, caller=None, event=None):
@@ -590,7 +735,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
     def onJumpButton(self, checked=False):
         """Jump slice views to the currently selected segment."""
         segmentID = self.currentSegmentID()
-        if not self.logic.isValidSegmentID(self.segmentationNode(), segmentID):
+        if not self.logic.isActiveSegmentID(self.segmentationNode(), segmentID):
             self._selectFirstSegmentIfNeeded()
             segmentID = self.currentSegmentID()
         self.jumpToSegment(segmentID)
@@ -614,6 +759,22 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self._setCurrentSegmentIDWithoutAutoJump(nextSegmentID)
         self.jumpToSegment(nextSegmentID)
         self.updateSegmentCountAndButtons()
+
+    def onLastShortcut(self):
+        """Run Last from the Left Arrow shortcut after checking keyboard navigation state."""
+        self._runNavigationShortcut(self.onLastButton)
+
+    def onNextShortcut(self):
+        """Run Next from the Right Arrow shortcut after checking keyboard navigation state."""
+        self._runNavigationShortcut(self.onNextButton)
+
+    def _runNavigationShortcut(self, navigationCallback):
+        """Run a keyboard navigation callback or show why it cannot run."""
+        blockingReason = self._navigationShortcutBlockingReason()
+        if blockingReason:
+            self._showShortcutMessage(blockingReason)
+            return
+        navigationCallback()
 
     def onAddButton(self, checked=False):
         """Add a segment using Segment Editor behavior, with a direct fallback."""
@@ -644,21 +805,29 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         """Toggle the selected segmentation visibility in both 2D and 3D views."""
         segmentationNode = self.segmentationNode()
         if not segmentationNode:
-            return
+            return None
         visible = not self.logic.isSegmentationVisible(segmentationNode)
         self.logic.setSegmentationVisible(segmentationNode, visible)
         self.updateSegmentCountAndButtons()
+        return visible
 
     def onSegmentationVisibilityShortcut(self):
-        """Toggle whole-segmentation visibility when the user presses Space."""
-        if self.visibilityButton and self.visibilityButton.enabled:
-            self.onSegmentationVisibilityButton()
+        """Toggle whole-segmentation visibility when the user presses H."""
+        blockingReason = self._visibilityShortcutBlockingReason()
+        if blockingReason:
+            self._showShortcutMessage(blockingReason)
+            return
+        visible = self.onSegmentationVisibilityButton()
+        self._showShortcutMessage("Mucus segmentation is now {}.".format("visible" if visible else "hidden"))
 
     def onDeleteButton(self, checked=False):
-        """Delete only the current segment after user confirmation."""
+        """Logically delete the current segment by moving it to the hidden restore backup."""
         segmentationNode = self.segmentationNode()
         segmentID = self.currentSegmentID()
         if not self.logic.isValidSegmentID(segmentationNode, segmentID):
+            return
+        if self.logic.isLogicallyDeletedSegment(segmentationNode, segmentID):
+            self._showShortcutMessage("This mucus plug segment is already logically deleted.")
             return
 
         segment = segmentationNode.GetSegmentation().GetSegment(segmentID)
@@ -666,24 +835,95 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         answer = qt.QMessageBox.question(
             slicer.util.mainWindow(),
             "Delete mucus plug segment",
-            "Are you sure you want to delete this mucus plug segment?\n\n{}".format(segmentName),
+            "Move this mucus plug segment to the deleted list?\nIt will disappear from the segment table, but you can restore it later.\n\n{}".format(segmentName),
             qt.QMessageBox.Yes | qt.QMessageBox.No,
             qt.QMessageBox.No,
         )
         if answer != qt.QMessageBox.Yes:
             return
 
-        nextSegmentID = self.logic.deleteSegmentAndGetNearby(segmentationNode, segmentID)
+        nextSegmentID = self.logic.logicalDeleteSegmentAndGetNearby(segmentationNode, segmentID)
         self._setCurrentSegmentIDWithoutAutoJump(nextSegmentID if nextSegmentID else "")
         self.updateSegmentCountAndButtons()
         if nextSegmentID:
             self.jumpToSegment(nextSegmentID)
 
+    def onRestoreButton(self, checked=False):
+        """Show a chooser for logically deleted segments and restore the selected ones."""
+        segmentationNode = self.segmentationNode()
+        deletedSegmentIDs = self.logic.logicallyDeletedSegmentIDs(segmentationNode)
+        if not deletedSegmentIDs:
+            self._showShortcutMessage("No logically deleted mucus plug segments to restore.")
+            return
+
+        selectedSegmentIDs = self._promptForDeletedSegmentsToRestore(segmentationNode, deletedSegmentIDs)
+        if selectedSegmentIDs is None:
+            return
+        if not selectedSegmentIDs:
+            self._showShortcutMessage("No mucus plug segments were selected to restore.")
+            return
+
+        restoredSegmentIDs = self.logic.restoreLogicallyDeletedSegments(segmentationNode, selectedSegmentIDs)
+        self.updateSegmentCountAndButtons()
+        if not restoredSegmentIDs:
+            self._showShortcutMessage("No selected mucus plug segments could be restored.")
+            return
+
+        firstRestoredSegmentID = restoredSegmentIDs[0]
+        self._setCurrentSegmentIDWithoutAutoJump(firstRestoredSegmentID)
+        self.jumpToSegment(firstRestoredSegmentID)
+        self._showShortcutMessage("Restored {} logically deleted mucus plug segment(s).".format(len(restoredSegmentIDs)))
+
+    def _promptForDeletedSegmentsToRestore(self, segmentationNode, deletedSegmentIDs):
+        """Ask the user which logically deleted segment IDs should be restored."""
+        dialog = qt.QDialog(slicer.util.mainWindow())
+        dialog.setWindowTitle("Restore mucus plug segments")
+
+        layout = qt.QVBoxLayout(dialog)
+        layout.addWidget(qt.QLabel("Select mucus plug segment(s) to restore:"))
+
+        listWidget = qt.QListWidget()
+        listWidget.setSelectionMode(qt.QAbstractItemView.ExtendedSelection)
+        backupNode = self.logic.deletedBackupNode(segmentationNode, create=False)
+        segmentation = backupNode.GetSegmentation() if backupNode else None
+        for index, segmentID in enumerate(deletedSegmentIDs):
+            segment = segmentation.GetSegment(segmentID) if segmentation else None
+            segmentName = segment.GetName() if segment else segmentID
+            item = qt.QListWidgetItem(segmentName)
+            item.setIcon(self._segmentColorIcon(segment, backupNode, segmentID))
+            item.setData(qt.Qt.UserRole, segmentID)
+            listWidget.addItem(item)
+            if index == 0:
+                item.setSelected(True)
+        layout.addWidget(listWidget)
+
+        buttonLayout = qt.QHBoxLayout()
+        buttonLayout.addStretch(1)
+        restoreButton = qt.QPushButton("Restore selected")
+        cancelButton = qt.QPushButton("Cancel")
+        restoreButton.connect("clicked(bool)", lambda checked=False: dialog.accept())
+        cancelButton.connect("clicked(bool)", lambda checked=False: dialog.reject())
+        buttonLayout.addWidget(restoreButton)
+        buttonLayout.addWidget(cancelButton)
+        layout.addLayout(buttonLayout)
+
+        if dialog.exec_() != qt.QDialog.Accepted:
+            return None
+        return [str(item.data(qt.Qt.UserRole)) for item in listWidget.selectedItems()]
+
+    def _segmentColorIcon(self, segment, backupNode=None, segmentID=""):
+        """Create a small color-square icon for a deleted segment list item."""
+        color = self.logic.deletedSegmentColor(backupNode, segmentID, segment)
+
+        pixmap = qt.QPixmap(18, 18)
+        pixmap.fill(qt.QColor(int(color[0] * 255), int(color[1] * 255), int(color[2] * 255)))
+        return qt.QIcon(pixmap)
+
     def onMeasureButton(self, checked=False):
         """Calculate volume and length for the current segment only when requested."""
         segmentationNode = self.segmentationNode()
         segmentID = self.currentSegmentID()
-        if not self.logic.isValidSegmentID(segmentationNode, segmentID):
+        if not self.logic.isActiveSegmentID(segmentationNode, segmentID):
             self.resetCurrentSegmentMeasurements()
             return
 
@@ -715,7 +955,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
     def onExportButton(self, checked=False):
         """Export all segment names, volumes, and lengths to a CSV file."""
         segmentationNode = self.segmentationNode()
-        segmentIDs = self.logic.segmentIDs(segmentationNode)
+        segmentIDs = self.logic.activeSegmentIDs(segmentationNode)
         if not segmentIDs:
             slicer.util.warningDisplay("No mucus plug segments to export.")
             return
@@ -780,7 +1020,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
     def jumpToSegment(self, segmentID):
         """Center slice views on a segment and apply the current jump zoom."""
         segmentationNode = self.segmentationNode()
-        if not self.logic.isValidSegmentID(segmentationNode, segmentID):
+        if not self.logic.isActiveSegmentID(segmentationNode, segmentID):
             return
         self.logic.ensureSourceVolumeVisible(self.sourceVolumeNode())
         self.logic.jumpToSegment(
@@ -807,11 +1047,12 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
     def updateSegmentCountAndButtons(self):
         """Refresh count text and enable or disable buttons based on current selection."""
         segmentationNode = self.segmentationNode()
-        count = self.logic.segmentCount(segmentationNode)
+        count = self.logic.activeSegmentCount(segmentationNode)
+        deletedCount = self.logic.logicallyDeletedSegmentCount(segmentationNode)
         self.countLabel.setText("Mucus plug count: {}".format(count))
 
         hasSegments = count > 0
-        hasCurrentSegment = self.logic.isValidSegmentID(segmentationNode, self.currentSegmentID())
+        hasCurrentSegment = self.logic.isActiveSegmentID(segmentationNode, self.currentSegmentID())
         hasSegmentation = segmentationNode is not None
 
         self.addButton.enabled = hasSegmentation
@@ -824,6 +1065,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.lastButton.enabled = hasSegments
         self.nextButton.enabled = hasSegments
         self.exportButton.enabled = hasSegments
+        self.restoreButton.enabled = deletedCount > 0
 
         self.deleteButton.enabled = hasCurrentSegment
         self.measureButton.enabled = hasCurrentSegment
@@ -836,14 +1078,14 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.lengthLabel.setText("Length: not calculated")
 
     def _selectFirstSegmentIfNeeded(self):
-        """Select the first available segment if the current segment is missing or invalid."""
+        """Select the first active segment if the current segment is missing, invalid, or deleted."""
         segmentationNode = self.segmentationNode()
         if not segmentationNode:
             return
         currentSegmentID = self.currentSegmentID()
-        if self.logic.isValidSegmentID(segmentationNode, currentSegmentID):
+        if self.logic.isActiveSegmentID(segmentationNode, currentSegmentID):
             return
-        segmentIDs = self.logic.segmentIDs(segmentationNode)
+        segmentIDs = self.logic.activeSegmentIDs(segmentationNode)
         self._setCurrentSegmentIDWithoutAutoJump(segmentIDs[0] if segmentIDs else "")
 
     def _setCurrentSegmentIDWithoutAutoJump(self, segmentID):
@@ -953,6 +1195,254 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
         """Return the number of mucus plug segments in the selected segmentation."""
         return len(self.segmentIDs(segmentationNode))
 
+    def activeSegmentIDs(self, segmentationNode):
+        """Return segment IDs currently present in the active segmentation."""
+        self.migrateLegacyLogicalDeletesToBackup(segmentationNode)
+        return self.segmentIDs(segmentationNode)
+
+    def activeSegmentCount(self, segmentationNode):
+        """Return the number of segments currently treated as active mucus plugs."""
+        return len(self.activeSegmentIDs(segmentationNode))
+
+    def logicallyDeletedSegmentIDs(self, segmentationNode):
+        """Return segment IDs moved into this module's hidden deleted-segment backup node."""
+        if not segmentationNode:
+            return []
+        self.migrateLegacyLogicalDeletesToBackup(segmentationNode)
+        return self.segmentIDs(self.deletedBackupNode(segmentationNode, create=False))
+
+    def logicallyDeletedSegmentCount(self, segmentationNode):
+        """Return the number of logically deleted segments still present in the segmentation."""
+        return len(self.logicallyDeletedSegmentIDs(segmentationNode))
+
+    def isLogicallyDeletedSegment(self, segmentationNode, segmentID):
+        """Return True if a segment has been moved into the hidden deleted-segment backup node."""
+        return segmentID in self.logicallyDeletedSegmentIDs(segmentationNode)
+
+    def isActiveSegmentID(self, segmentationNode, segmentID):
+        """Return True if a segment exists in the active segmentation."""
+        return self.isValidSegmentID(segmentationNode, segmentID)
+
+    def logicalDeleteSegmentAndGetNearby(self, segmentationNode, segmentID):
+        """Move a segment into a hidden backup node and return a nearby active segment ID."""
+        activeSegmentIDs = self.activeSegmentIDs(segmentationNode)
+        if segmentID not in activeSegmentIDs:
+            return ""
+
+        removedIndex = activeSegmentIDs.index(segmentID)
+        self.moveSegmentToDeletedBackup(segmentationNode, segmentID)
+
+        remainingSegmentIDs = self.activeSegmentIDs(segmentationNode)
+        if not remainingSegmentIDs:
+            return ""
+        return remainingSegmentIDs[min(removedIndex, len(remainingSegmentIDs) - 1)]
+
+    def restoreLogicallyDeletedSegments(self, segmentationNode, segmentIDs=None):
+        """Move selected deleted segments from the hidden backup node back to the active segmentation."""
+        deletedSegmentIDs = self.logicallyDeletedSegmentIDs(segmentationNode)
+        if segmentIDs is None:
+            restoredSegmentIDs = deletedSegmentIDs
+        else:
+            requestedSegmentIDs = set(segmentIDs)
+            restoredSegmentIDs = [segmentID for segmentID in deletedSegmentIDs if segmentID in requestedSegmentIDs]
+        backupNode = self.deletedBackupNode(segmentationNode, create=False)
+        if not backupNode:
+            return []
+        actuallyRestoredSegmentIDs = []
+        for segmentID in restoredSegmentIDs:
+            if self.copySegmentBetweenSegmentations(backupNode, segmentationNode, segmentID):
+                backupNode.GetSegmentation().RemoveSegment(segmentID)
+                backupNode.SetAttribute(self.deletedSegmentColorAttributeName(segmentID), None)
+                backupNode.Modified()
+                actuallyRestoredSegmentIDs.append(segmentID)
+        segmentationNode.Modified()
+        self.cleanupDeletedBackupNodeIfEmpty(segmentationNode)
+        return actuallyRestoredSegmentIDs
+
+    def setSegmentVisible(self, segmentationNode, segmentID, visible):
+        """Set per-segment visibility without changing segment voxel data."""
+        if not self.isValidSegmentID(segmentationNode, segmentID):
+            return
+        segmentationNode.CreateDefaultDisplayNodes()
+        displayNode = segmentationNode.GetDisplayNode()
+        if not displayNode:
+            return
+        if hasattr(displayNode, "SetSegmentVisibility"):
+            displayNode.SetSegmentVisibility(segmentID, bool(visible))
+        displayNode.Modified()
+
+    def moveSegmentToDeletedBackup(self, segmentationNode, segmentID):
+        """Copy a segment into the hidden deleted backup node and remove it from the active segmentation."""
+        backupNode = self.deletedBackupNode(segmentationNode, create=True)
+        if not backupNode:
+            return False
+        self.storeDeletedSegmentColor(segmentationNode, backupNode, segmentID)
+        if not self.copySegmentBetweenSegmentations(segmentationNode, backupNode, segmentID):
+            return False
+        segmentationNode.GetSegmentation().RemoveSegment(segmentID)
+        segmentationNode.Modified()
+        return True
+
+    def copySegmentBetweenSegmentations(self, sourceSegmentationNode, targetSegmentationNode, segmentID):
+        """Copy one segment between segmentation nodes while preserving its segment ID when possible."""
+        if not self.isValidSegmentID(sourceSegmentationNode, segmentID) or not targetSegmentationNode:
+            return False
+        sourceSegmentation = sourceSegmentationNode.GetSegmentation()
+        targetSegmentation = targetSegmentationNode.GetSegmentation()
+        if not sourceSegmentation or not targetSegmentation:
+            return False
+        if targetSegmentation.GetSegment(segmentID):
+            return True
+        try:
+            segmentCopy = slicer.vtkSegment()
+            segmentCopy.DeepCopy(sourceSegmentation.GetSegment(segmentID))
+            targetSegmentation.AddSegment(segmentCopy, segmentID)
+            targetSegmentationNode.Modified()
+            return targetSegmentation.GetSegment(segmentID) is not None
+        except Exception:
+            logging.debug("vtkSegment.DeepCopy failed; trying CopySegmentFromSegmentation", exc_info=True)
+        try:
+            targetSegmentation.CopySegmentFromSegmentation(sourceSegmentation, segmentID)
+            targetSegmentationNode.Modified()
+            return targetSegmentation.GetSegment(segmentID) is not None
+        except Exception:
+            logging.exception("Could not copy segment: %s", segmentID)
+            return False
+
+    def deletedBackupNode(self, segmentationNode, create=False):
+        """Return the hidden segmentation node used to keep logically deleted segments restorable."""
+        if not segmentationNode:
+            return None
+        backupNode = None
+        backupNodeID = segmentationNode.GetAttribute(DELETED_BACKUP_NODE_ATTRIBUTE)
+        if backupNodeID:
+            backupNode = slicer.mrmlScene.GetNodeByID(backupNodeID)
+        if backupNode or not create:
+            return backupNode
+
+        backupNodeName = "{} deleted mucus backup".format(segmentationNode.GetName())
+        backupNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", backupNodeName)
+        backupNode.SetAttribute(DELETED_BACKUP_SOURCE_ATTRIBUTE, segmentationNode.GetID())
+        segmentationNode.SetAttribute(DELETED_BACKUP_NODE_ATTRIBUTE, backupNode.GetID())
+        self.configureDeletedBackupNode(backupNode)
+        return backupNode
+
+    def configureDeletedBackupNode(self, backupNode):
+        """Hide the deleted-segment backup node from normal Slicer editors and views."""
+        if not backupNode:
+            return
+        try:
+            backupNode.HideFromEditorsOn()
+        except Exception:
+            try:
+                backupNode.SetHideFromEditors(True)
+            except Exception:
+                logging.debug("Could not hide deleted backup node from editors", exc_info=True)
+        backupNode.CreateDefaultDisplayNodes()
+        displayNode = backupNode.GetDisplayNode()
+        if displayNode:
+            displayNode.SetVisibility(False)
+            if hasattr(displayNode, "SetVisibility2D"):
+                displayNode.SetVisibility2D(False)
+            if hasattr(displayNode, "SetVisibility3D"):
+                displayNode.SetVisibility3D(False)
+        backupNode.Modified()
+
+    def storeDeletedSegmentColor(self, segmentationNode, backupNode, segmentID):
+        """Store a deleted segment's color on the backup node so the restore list can show it."""
+        segment = segmentationNode.GetSegmentation().GetSegment(segmentID) if segmentationNode else None
+        color = self.segmentColor(segment)
+        if backupNode and color:
+            backupNode.SetAttribute(self.deletedSegmentColorAttributeName(segmentID), json.dumps(color))
+
+    def deletedSegmentColor(self, backupNode, segmentID, segment=None):
+        """Return the stored or segment-defined color for a deleted segment."""
+        if backupNode and segmentID:
+            storedValue = backupNode.GetAttribute(self.deletedSegmentColorAttributeName(segmentID))
+            if storedValue:
+                try:
+                    color = json.loads(storedValue)
+                    if len(color) >= 3:
+                        return [float(color[0]), float(color[1]), float(color[2])]
+                except Exception:
+                    logging.debug("Could not parse deleted segment color", exc_info=True)
+        color = self.segmentColor(segment)
+        return color if color else [0.5, 0.5, 0.5]
+
+    def segmentColor(self, segment):
+        """Return a segment color as RGB values between 0 and 1."""
+        if not segment:
+            return None
+        try:
+            color = segment.GetColor()
+            if color and len(color) >= 3:
+                return [float(color[0]), float(color[1]), float(color[2])]
+        except Exception:
+            pass
+        try:
+            color = [0.5, 0.5, 0.5]
+            segment.GetColor(color)
+            return [float(color[0]), float(color[1]), float(color[2])]
+        except Exception:
+            logging.debug("Could not read segment color", exc_info=True)
+            return None
+
+    def deletedSegmentColorAttributeName(self, segmentID):
+        """Return the backup-node attribute name used to store one deleted segment color."""
+        return "{}{}".format(DELETED_SEGMENT_COLOR_ATTRIBUTE_PREFIX, segmentID)
+
+    def cleanupDeletedBackupNodeIfEmpty(self, segmentationNode):
+        """Remove the hidden backup node reference when it has no deleted segments."""
+        backupNode = self.deletedBackupNode(segmentationNode, create=False)
+        if not backupNode or self.segmentCount(backupNode) > 0:
+            return
+        segmentationNode.SetAttribute(DELETED_BACKUP_NODE_ATTRIBUTE, None)
+        slicer.mrmlScene.RemoveNode(backupNode)
+        segmentationNode.Modified()
+
+    def migrateLegacyLogicalDeletesToBackup(self, segmentationNode):
+        """Move old hidden-only logical deletes into the hidden backup node so rows disappear."""
+        if not segmentationNode:
+            return
+        legacySegmentIDs = self.legacyLogicallyDeletedSegmentIDs(segmentationNode)
+        if not legacySegmentIDs:
+            return
+        for segmentID in legacySegmentIDs:
+            if self.isValidSegmentID(segmentationNode, segmentID):
+                self.moveSegmentToDeletedBackup(segmentationNode, segmentID)
+        segmentationNode.SetAttribute(LOGICALLY_DELETED_SEGMENTS_ATTRIBUTE, None)
+        segmentationNode.Modified()
+
+    def legacyLogicallyDeletedSegmentIDs(self, segmentationNode):
+        """Return old hidden-only logical delete IDs stored before the backup-node design."""
+        if not segmentationNode:
+            return []
+        storedValue = segmentationNode.GetAttribute(LOGICALLY_DELETED_SEGMENTS_ATTRIBUTE)
+        if not storedValue:
+            return []
+        try:
+            segmentIDs = json.loads(storedValue)
+        except Exception:
+            logging.debug("Could not parse legacy logical delete segment list", exc_info=True)
+            return []
+        validSegmentIDs = set(self.segmentIDs(segmentationNode))
+        return [segmentID for segmentID in segmentIDs if segmentID in validSegmentIDs]
+
+    def _setLogicallyDeletedSegmentIDs(self, segmentationNode, segmentIDs):
+        """Store logical delete segment IDs on the segmentation node."""
+        if not segmentationNode:
+            return
+        orderedUniqueSegmentIDs = []
+        validSegmentIDs = set(self.segmentIDs(segmentationNode))
+        for segmentID in segmentIDs:
+            if segmentID in validSegmentIDs and segmentID not in orderedUniqueSegmentIDs:
+                orderedUniqueSegmentIDs.append(segmentID)
+        if orderedUniqueSegmentIDs:
+            segmentationNode.SetAttribute(LOGICALLY_DELETED_SEGMENTS_ATTRIBUTE, json.dumps(orderedUniqueSegmentIDs))
+        else:
+            segmentationNode.SetAttribute(LOGICALLY_DELETED_SEGMENTS_ATTRIBUTE, None)
+        segmentationNode.Modified()
+
     def mucusPlugMeasurementRows(self, segmentationNode, referenceVolumeNode=None, skipLengthAbovePixels=None):
         """Return CSV-ready measurement rows for every segment in segmentation order."""
         rows = []
@@ -960,7 +1450,7 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
             return rows
 
         segmentation = segmentationNode.GetSegmentation()
-        for segmentID in self.segmentIDs(segmentationNode):
+        for segmentID in self.activeSegmentIDs(segmentationNode):
             segment = segmentation.GetSegment(segmentID) if segmentation else None
             segmentName = segment.GetName() if segment else segmentID
             metrics = self.segmentVoxelMetrics(
@@ -1070,7 +1560,7 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
 
     def nextSegmentID(self, segmentationNode, currentSegmentID, wrap=True):
         """Return the next segment ID in segmentation order."""
-        segmentIDs = self.segmentIDs(segmentationNode)
+        segmentIDs = self.activeSegmentIDs(segmentationNode)
         if not segmentIDs:
             return ""
         if currentSegmentID not in segmentIDs:
@@ -1083,7 +1573,7 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
 
     def previousSegmentID(self, segmentationNode, currentSegmentID, wrap=True):
         """Return the previous segment ID in segmentation order."""
-        segmentIDs = self.segmentIDs(segmentationNode)
+        segmentIDs = self.activeSegmentIDs(segmentationNode)
         if not segmentIDs:
             return ""
         if currentSegmentID not in segmentIDs:

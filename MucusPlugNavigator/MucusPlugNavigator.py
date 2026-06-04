@@ -74,6 +74,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.logic = MucusPlugNavigatorLogic()
         self.segmentEditorNode = None
         self.segmentEditorWidget = None
+        self.visibilityShortcut = None
 
         self._observedSegmentation = None
         self._segmentationObserverTags = []
@@ -96,11 +97,13 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self._buildNavigationSection()
         self._buildActionToolbarSection()
         self._buildEmbeddedSegmentEditorSection()
+        self._createVisibilityShortcut()
         self._connectSignals()
         self._initializeWidgetState()
 
     def cleanup(self):
         """Release observers and Segment Editor view hooks when Slicer unloads the module."""
+        self._removeVisibilityShortcut()
         self._removeSegmentationObservers()
         self._removeSegmentationDisplayObservers()
         if self.segmentEditorWidget:
@@ -111,6 +114,8 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
     def enter(self):
         """Install Segment Editor view hooks when the module becomes active."""
+        if self.visibilityShortcut:
+            self.visibilityShortcut.enabled = True
         if self.segmentEditorWidget:
             self.segmentEditorWidget.setMRMLScene(slicer.mrmlScene)
             self.segmentEditorWidget.setupViewObservations()
@@ -119,6 +124,8 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
     def exit(self):
         """Remove Segment Editor view hooks when the user leaves the module."""
+        if self.visibilityShortcut:
+            self.visibilityShortcut.enabled = False
         if self.segmentEditorWidget:
             self.segmentEditorWidget.setActiveEffect(None)
             self.segmentEditorWidget.removeViewObservations()
@@ -224,7 +231,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.show3DButton = self._createButton("Show 3D", "Toggle 3D display for the selected segmentation.")
         segmentToolbarLayout.addWidget(self.show3DButton, 0, 1)
 
-        self.visibilityButton = self._createButton("Hide Seg", "Toggle whole segmentation visibility in 2D and 3D.")
+        self.visibilityButton = self._createButton("Hide Seg", "Toggle whole segmentation visibility in 2D and 3D. Shortcut: Space.")
         segmentToolbarLayout.addWidget(self.visibilityButton, 0, 2)
 
         self.deleteButton = self._createButton("Delete", "Delete only the currently selected mucus plug segment.")
@@ -302,6 +309,25 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         button = qt.QPushButton(text)
         button.setToolTip(toolTip)
         return button
+
+    def _createVisibilityShortcut(self):
+        """Bind the Space key to the whole-segmentation visibility button."""
+        shortcutParent = self.parent if self.parent else slicer.util.mainWindow()
+        self.visibilityShortcut = qt.QShortcut(shortcutParent)
+        self.visibilityShortcut.setKey(qt.QKeySequence("Space"))
+        self.visibilityShortcut.setContext(qt.Qt.ApplicationShortcut)
+        self.visibilityShortcut.connect("activated()", self.onSegmentationVisibilityShortcut)
+
+    def _removeVisibilityShortcut(self):
+        """Disable and delete the Space shortcut so reloads do not leave duplicate bindings."""
+        if not self.visibilityShortcut:
+            return
+        self.visibilityShortcut.enabled = False
+        try:
+            self.visibilityShortcut.deleteLater()
+        except Exception:
+            logging.debug("Could not delete visibility shortcut cleanly", exc_info=True)
+        self.visibilityShortcut = None
 
     def _hideBackupJumpButton(self):
         """Keep the manual Jump button in code as a backup, but hide it from the normal UI."""
@@ -622,6 +648,11 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         visible = not self.logic.isSegmentationVisible(segmentationNode)
         self.logic.setSegmentationVisible(segmentationNode, visible)
         self.updateSegmentCountAndButtons()
+
+    def onSegmentationVisibilityShortcut(self):
+        """Toggle whole-segmentation visibility when the user presses Space."""
+        if self.visibilityButton and self.visibilityButton.enabled:
+            self.onSegmentationVisibilityButton()
 
     def onDeleteButton(self, checked=False):
         """Delete only the current segment after user confirmation."""

@@ -18,7 +18,9 @@ SEGMENT_EDITOR_SINGLETON_TAG = "MucusPlugNavigatorSegmentEditor"
 SEGMENT_EDITOR_NODE_NAME = "MucusPlugNavigatorSegmentEditor"
 MODULE_NAME = "MucusPlugNavigator"
 MODULE_TITLE = "Mucus Plug Navigator"
-LOGICALLY_DELETED_SEGMENTS_ATTRIBUTE = "MucusPlugNavigator.LogicallyDeletedSegmentIDs"
+LOGICALLY_DELETED_SEGMENTS_ATTRIBUTE = (
+    "MucusPlugNavigator.LogicallyDeletedSegmentIDs"
+)
 DELETED_BACKUP_NODE_ATTRIBUTE = "MucusPlugNavigator.DeletedBackupNodeID"
 DELETED_BACKUP_SOURCE_ATTRIBUTE = "MucusPlugNavigator.DeletedBackupSourceNodeID"
 DELETED_SEGMENT_COLOR_ATTRIBUTE_PREFIX = "MucusPlugNavigator.DeletedSegmentColor."
@@ -27,7 +29,7 @@ BUTTON_MINIMUM_WIDTH = 92
 BUTTON_MINIMUM_HEIGHT = 32
 
 JUMP_ZOOM_MINIMUM = 1.0
-JUMP_ZOOM_MAXIMUM = 10.0
+JUMP_ZOOM_MAXIMUM = 20.0
 JUMP_ZOOM_DECIMALS = 1
 JUMP_ZOOM_STEP = 0.5
 JUMP_ZOOM_DEFAULT = 1.0
@@ -46,7 +48,7 @@ GRID_VERTICAL_SPACING = 4
 
 
 class MucusPlugNavigator(ScriptedLoadableModule):
-    """Navigate, inspect, edit, delete, measure, export, and count existing mucus plug segments."""
+    """Navigate, inspect, edit, delete, measure, export, and count mucus plugs."""
 
     def __init__(self, parent):
         """Initialize the scripted module metadata shown by 3D Slicer."""
@@ -219,17 +221,28 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.zoomSpinBox.setSingleStep(JUMP_ZOOM_STEP)
         self.zoomSpinBox.setSuffix("x")
         self.zoomSpinBox.setValue(JUMP_ZOOM_DEFAULT)
-        self.zoomSpinBox.setToolTip("Higher zoom uses a smaller slice field of view after jumping.")
+        self.zoomSpinBox.setToolTip(
+            "Higher zoom uses a smaller slice field of view after jumping."
+        )
         controlsLayout.addWidget(self.zoomSpinBox, 1, 1)
 
-        self.jumpButton = self._createButton("Jump", "Jump slice views to the currently selected mucus plug.")
+        self.jumpButton = self._createButton(
+            "Jump",
+            "Jump slice views to the currently selected mucus plug.",
+        )
         controlsLayout.addWidget(self.jumpButton, 1, 2)
         self._hideBackupJumpButton()
 
-        self.lastButton = self._createButton("Last", "Select the previous segment in segmentation order and jump to it.")
+        self.lastButton = self._createButton(
+            "Last",
+            "Select the previous segment in segmentation order and jump to it.",
+        )
         controlsLayout.addWidget(self.lastButton, 1, 3)
 
-        self.nextButton = self._createButton("Next", "Select the next segment in segmentation order and jump to it.")
+        self.nextButton = self._createButton(
+            "Next",
+            "Select the next segment in segmentation order and jump to it.",
+        )
         controlsLayout.addWidget(self.nextButton, 1, 4)
 
         self._setNavigationButtonIcons()
@@ -242,34 +255,64 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         segmentToolbarFrame.setLayout(segmentToolbarLayout)
         self._configureGridLayout(segmentToolbarLayout)
 
-        self.addButton = self._createButton("Add", "Add a new segment to the selected segmentation.")
+        self.addButton = self._createButton(
+            "Add",
+            "Add a new segment to the selected segmentation.",
+        )
         segmentToolbarLayout.addWidget(self.addButton, 0, 0)
 
-        self.show3DButton = self._createButton("Show 3D", "Toggle 3D display for the selected segmentation.")
+        self.show3DButton = self._createButton(
+            "Show 3D",
+            "Toggle 3D display for the selected segmentation.",
+        )
         segmentToolbarLayout.addWidget(self.show3DButton, 0, 1)
 
-        self.visibilityButton = self._createButton("Hide Seg", "Toggle whole segmentation visibility in 2D and 3D. Shortcut: H.")
+        self.visibilityButton = self._createButton(
+            "Hide Seg",
+            "Toggle whole segmentation visibility in 2D and 3D. Shortcut: H.",
+        )
         segmentToolbarLayout.addWidget(self.visibilityButton, 0, 2)
 
-        self.deleteButton = self._createButton("Delete", "Delete only the currently selected mucus plug segment.")
+        self.deleteButton = self._createButton(
+            "Delete",
+            "Delete only the currently selected mucus plug segment.",
+        )
         segmentToolbarLayout.addWidget(self.deleteButton, 0, 3)
 
-        self.measureButton = self._createButton("Measure", "Calculate volume and length for the currently selected mucus plug.")
+        self.measureButton = self._createButton(
+            "Measure",
+            "Calculate volume and length for the currently selected mucus plug.",
+        )
         segmentToolbarLayout.addWidget(self.measureButton, 0, 4)
 
-        self.noEditingButton = self._createButton("No editing", "Turn off the active Segment Editor effect.")
+        self.noEditingButton = self._createButton(
+            "No editing",
+            "Turn off the active Segment Editor effect.",
+        )
         segmentToolbarLayout.addWidget(self.noEditingButton, 1, 0)
 
-        self.paintButton = self._createButton("Paint", "Activate the Segment Editor Paint effect.")
+        self.paintButton = self._createButton(
+            "Paint",
+            "Activate the Segment Editor Paint effect.",
+        )
         segmentToolbarLayout.addWidget(self.paintButton, 1, 1)
 
-        self.eraseButton = self._createButton("Erase", "Activate the Segment Editor Erase effect.")
+        self.eraseButton = self._createButton(
+            "Erase",
+            "Activate the Segment Editor Erase effect.",
+        )
         segmentToolbarLayout.addWidget(self.eraseButton, 1, 2)
 
-        self.exportButton = self._createButton("Export", "Export segment name, volume, and length for all mucus plugs to a CSV file.")
+        self.exportButton = self._createButton(
+            "Export",
+            "Export segment name, volume, and length for all mucus plugs to a CSV file.",
+        )
         segmentToolbarLayout.addWidget(self.exportButton, 1, 3)
 
-        self.restoreButton = self._createButton("Restore", "Choose logically deleted mucus plug segments to show again.")
+        self.restoreButton = self._createButton(
+            "Restore",
+            "Choose logically deleted mucus plug segments to show again.",
+        )
         segmentToolbarLayout.addWidget(self.restoreButton, 1, 4)
 
         self.layout.addWidget(segmentToolbarFrame)
@@ -285,8 +328,14 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
     def _connectSignals(self):
         """Connect all Qt signals after every widget has been created."""
-        self.segmentationSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.onSegmentationNodeChanged)
-        self.sourceVolumeSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.onSourceVolumeNodeChanged)
+        self.segmentationSelector.connect(
+            "currentNodeChanged(vtkMRMLNode*)",
+            self.onSegmentationNodeChanged,
+        )
+        self.sourceVolumeSelector.connect(
+            "currentNodeChanged(vtkMRMLNode*)",
+            self.onSourceVolumeNodeChanged,
+        )
 
         self.jumpButton.connect("clicked(bool)", self.onJumpButton)
         self.lastButton.connect("clicked(bool)", self.onLastButton)
@@ -303,7 +352,10 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.exportButton.connect("clicked(bool)", self.onExportButton)
 
         self.zoomSpinBox.connect("valueChanged(double)", self.onZoomChanged)
-        self.segmentEditorWidget.connect("currentSegmentIDChanged(QString)", self.onCurrentSegmentChanged)
+        self.segmentEditorWidget.connect(
+            "currentSegmentIDChanged(QString)",
+            self.onCurrentSegmentChanged,
+        )
 
     def _initializeWidgetState(self):
         """Synchronize the widget with any nodes already selected in the scene."""
@@ -333,7 +385,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
     def _createVisibilityShortcut(self):
         """Bind the H key to the whole-segmentation visibility button."""
-        shortcutParent = slicer.util.mainWindow() if slicer.util.mainWindow() else self.parent
+        shortcutParent = self._shortcutParent()
         self.visibilityShortcut = qt.QShortcut(shortcutParent)
         self.visibilityShortcut.setKey(self._visibilityShortcutKeySequence())
         self.visibilityShortcut.setContext(qt.Qt.ApplicationShortcut)
@@ -344,9 +396,24 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
     def _createNavigationShortcuts(self):
         """Bind Left and Right Arrow keys to the Last and Next navigation buttons."""
-        shortcutParent = slicer.util.mainWindow() if slicer.util.mainWindow() else self.parent
-        self.lastShortcut = self._createShortcut(shortcutParent, qt.Qt.Key_Left, "Left", self.onLastShortcut)
-        self.nextShortcut = self._createShortcut(shortcutParent, qt.Qt.Key_Right, "Right", self.onNextShortcut)
+        shortcutParent = self._shortcutParent()
+        self.lastShortcut = self._createShortcut(
+            shortcutParent,
+            qt.Qt.Key_Left,
+            "Left",
+            self.onLastShortcut,
+        )
+        self.nextShortcut = self._createShortcut(
+            shortcutParent,
+            qt.Qt.Key_Right,
+            "Right",
+            self.onNextShortcut,
+        )
+
+    def _shortcutParent(self):
+        """Return the preferred Qt parent for module-level shortcuts."""
+        mainWindow = slicer.util.mainWindow()
+        return mainWindow if mainWindow else self.parent
 
     def _createShortcut(self, parent, key, fallbackText, callback):
         """Create an application-level shortcut for one keyboard action."""
@@ -425,7 +492,6 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         if self.logic.activeSegmentCount(self.segmentationNode()) == 0:
             return "Arrow shortcut cannot navigate: no mucus plug segments are available."
         return ""
-
 
     def _isModuleActiveForShortcut(self):
         """Return True when this module should respond to the visibility shortcut."""
@@ -640,7 +706,11 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             self._buttonText(button) in ("Add", "Remove", "Show 3D")
             for button in mostLikelyEffectGrid.findChildren(qt.QAbstractButton)
         )
-        if parentCounts[mostLikelyEffectGrid] >= 2 and mostLikelyEffectGrid != self.segmentEditorWidget and not containsToolbarButton:
+        if (
+            parentCounts[mostLikelyEffectGrid] >= 2
+            and mostLikelyEffectGrid != self.segmentEditorWidget
+            and not containsToolbarButton
+        ):
             mostLikelyEffectGrid.hide()
 
     def _normalizeButtonSizePolicies(self):
@@ -717,7 +787,10 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         """Clear stale measurements, refresh buttons, and auto-jump after user segment clicks."""
         self.resetCurrentSegmentMeasurements()
         self.updateSegmentCountAndButtons()
-        if not self._suppressAutoJump and self.logic.isActiveSegmentID(self.segmentationNode(), segmentID):
+        if (
+            not self._suppressAutoJump
+            and self.logic.isActiveSegmentID(self.segmentationNode(), segmentID)
+        ):
             self.jumpToSegment(segmentID)
 
     def onObservedSegmentationChanged(self, caller=None, event=None):
@@ -743,7 +816,11 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
     def onLastButton(self, checked=False):
         """Select the previous segment in segmentation order and jump to it."""
         segmentationNode = self.segmentationNode()
-        previousSegmentID = self.logic.previousSegmentID(segmentationNode, self.currentSegmentID(), wrap=True)
+        previousSegmentID = self.logic.previousSegmentID(
+            segmentationNode,
+            self.currentSegmentID(),
+            wrap=True,
+        )
         if not previousSegmentID:
             return
         self._setCurrentSegmentIDWithoutAutoJump(previousSegmentID)
@@ -753,7 +830,11 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
     def onNextButton(self, checked=False):
         """Select the next segment in segmentation order and jump to it."""
         segmentationNode = self.segmentationNode()
-        nextSegmentID = self.logic.nextSegmentID(segmentationNode, self.currentSegmentID(), wrap=True)
+        nextSegmentID = self.logic.nextSegmentID(
+            segmentationNode,
+            self.currentSegmentID(),
+            wrap=True,
+        )
         if not nextSegmentID:
             return
         self._setCurrentSegmentIDWithoutAutoJump(nextSegmentID)
@@ -827,7 +908,9 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         if not self.logic.isValidSegmentID(segmentationNode, segmentID):
             return
         if self.logic.isLogicallyDeletedSegment(segmentationNode, segmentID):
-            self._showShortcutMessage("This mucus plug segment is already logically deleted.")
+            self._showShortcutMessage(
+                "This mucus plug segment is already logically deleted."
+            )
             return
 
         segment = segmentationNode.GetSegmentation().GetSegment(segmentID)
@@ -835,14 +918,21 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         answer = qt.QMessageBox.question(
             slicer.util.mainWindow(),
             "Delete mucus plug segment",
-            "Move this mucus plug segment to the deleted list?\nIt will disappear from the segment table, but you can restore it later.\n\n{}".format(segmentName),
+            (
+                "Move this mucus plug segment to the deleted list?\n"
+                "It will disappear from the segment table, but you can restore it later."
+                "\n\n{}".format(segmentName)
+            ),
             qt.QMessageBox.Yes | qt.QMessageBox.No,
             qt.QMessageBox.No,
         )
         if answer != qt.QMessageBox.Yes:
             return
 
-        nextSegmentID = self.logic.logicalDeleteSegmentAndGetNearby(segmentationNode, segmentID)
+        nextSegmentID = self.logic.logicalDeleteSegmentAndGetNearby(
+            segmentationNode,
+            segmentID,
+        )
         self._setCurrentSegmentIDWithoutAutoJump(nextSegmentID if nextSegmentID else "")
         self.updateSegmentCountAndButtons()
         if nextSegmentID:
@@ -856,14 +946,20 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             self._showShortcutMessage("No logically deleted mucus plug segments to restore.")
             return
 
-        selectedSegmentIDs = self._promptForDeletedSegmentsToRestore(segmentationNode, deletedSegmentIDs)
+        selectedSegmentIDs = self._promptForDeletedSegmentsToRestore(
+            segmentationNode,
+            deletedSegmentIDs,
+        )
         if selectedSegmentIDs is None:
             return
         if not selectedSegmentIDs:
             self._showShortcutMessage("No mucus plug segments were selected to restore.")
             return
 
-        restoredSegmentIDs = self.logic.restoreLogicallyDeletedSegments(segmentationNode, selectedSegmentIDs)
+        restoredSegmentIDs = self.logic.restoreLogicallyDeletedSegments(
+            segmentationNode,
+            selectedSegmentIDs,
+        )
         self.updateSegmentCountAndButtons()
         if not restoredSegmentIDs:
             self._showShortcutMessage("No selected mucus plug segments could be restored.")
@@ -872,14 +968,19 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         firstRestoredSegmentID = restoredSegmentIDs[0]
         self._setCurrentSegmentIDWithoutAutoJump(firstRestoredSegmentID)
         self.jumpToSegment(firstRestoredSegmentID)
-        self._showShortcutMessage("Restored {} logically deleted mucus plug segment(s).".format(len(restoredSegmentIDs)))
+        self._showShortcutMessage(
+            "Restored {} logically deleted mucus plug segment(s).".format(
+                len(restoredSegmentIDs)
+            )
+        )
 
     def _promptForDeletedSegmentsToRestore(self, segmentationNode, deletedSegmentIDs):
         """Ask the user which logically deleted segment IDs should be restored."""
         dialog = qt.QDialog(slicer.util.mainWindow())
         dialog.setWindowTitle("Restore mucus plug segments")
 
-        layout = qt.QVBoxLayout(dialog)
+        layout = qt.QVBoxLayout()
+        dialog.setLayout(layout)
         layout.addWidget(qt.QLabel("Select mucus plug segment(s) to restore:"))
 
         listWidget = qt.QListWidget()
@@ -897,7 +998,9 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
                 item.setSelected(True)
         layout.addWidget(listWidget)
 
+        buttonFrame = qt.QFrame()
         buttonLayout = qt.QHBoxLayout()
+        buttonFrame.setLayout(buttonLayout)
         buttonLayout.addStretch(1)
         restoreButton = qt.QPushButton("Restore selected")
         cancelButton = qt.QPushButton("Cancel")
@@ -905,7 +1008,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         cancelButton.connect("clicked(bool)", lambda checked=False: dialog.reject())
         buttonLayout.addWidget(restoreButton)
         buttonLayout.addWidget(cancelButton)
-        layout.addLayout(buttonLayout)
+        layout.addWidget(buttonFrame)
 
         if dialog.exec_() != qt.QDialog.Accepted:
             return None
@@ -916,7 +1019,13 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         color = self.logic.deletedSegmentColor(backupNode, segmentID, segment)
 
         pixmap = qt.QPixmap(18, 18)
-        pixmap.fill(qt.QColor(int(color[0] * 255), int(color[1] * 255), int(color[2] * 255)))
+        pixmap.fill(
+            qt.QColor(
+                int(color[0] * 255),
+                int(color[1] * 255),
+                int(color[2] * 255),
+            )
+        )
         return qt.QIcon(pixmap)
 
     def onMeasureButton(self, checked=False):
@@ -1189,7 +1298,10 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
         segmentation = segmentationNode.GetSegmentation()
         if not segmentation:
             return []
-        return [segmentation.GetNthSegmentID(index) for index in range(segmentation.GetNumberOfSegments())]
+        return [
+            segmentation.GetNthSegmentID(index)
+            for index in range(segmentation.GetNumberOfSegments())
+        ]
 
     def segmentCount(self, segmentationNode):
         """Return the number of mucus plug segments in the selected segmentation."""
@@ -1244,7 +1356,11 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
             restoredSegmentIDs = deletedSegmentIDs
         else:
             requestedSegmentIDs = set(segmentIDs)
-            restoredSegmentIDs = [segmentID for segmentID in deletedSegmentIDs if segmentID in requestedSegmentIDs]
+            restoredSegmentIDs = [
+                segmentID
+                for segmentID in deletedSegmentIDs
+                if segmentID in requestedSegmentIDs
+            ]
         backupNode = self.deletedBackupNode(segmentationNode, create=False)
         if not backupNode:
             return []
@@ -1252,7 +1368,10 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
         for segmentID in restoredSegmentIDs:
             if self.copySegmentBetweenSegmentations(backupNode, segmentationNode, segmentID):
                 backupNode.GetSegmentation().RemoveSegment(segmentID)
-                backupNode.SetAttribute(self.deletedSegmentColorAttributeName(segmentID), None)
+                backupNode.SetAttribute(
+                    self.deletedSegmentColorAttributeName(segmentID),
+                    None,
+                )
                 backupNode.Modified()
                 actuallyRestoredSegmentIDs.append(segmentID)
         segmentationNode.Modified()
@@ -1285,7 +1404,10 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
 
     def copySegmentBetweenSegmentations(self, sourceSegmentationNode, targetSegmentationNode, segmentID):
         """Copy one segment between segmentation nodes while preserving its segment ID when possible."""
-        if not self.isValidSegmentID(sourceSegmentationNode, segmentID) or not targetSegmentationNode:
+        if (
+            not self.isValidSegmentID(sourceSegmentationNode, segmentID)
+            or not targetSegmentationNode
+        ):
             return False
         sourceSegmentation = sourceSegmentationNode.GetSegmentation()
         targetSegmentation = targetSegmentationNode.GetSegmentation()
@@ -1300,7 +1422,10 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
             targetSegmentationNode.Modified()
             return targetSegmentation.GetSegment(segmentID) is not None
         except Exception:
-            logging.debug("vtkSegment.DeepCopy failed; trying CopySegmentFromSegmentation", exc_info=True)
+            logging.debug(
+                "vtkSegment.DeepCopy failed; trying CopySegmentFromSegmentation",
+                exc_info=True,
+            )
         try:
             targetSegmentation.CopySegmentFromSegmentation(sourceSegmentation, segmentID)
             targetSegmentationNode.Modified()
@@ -1321,7 +1446,10 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
             return backupNode
 
         backupNodeName = "{} deleted mucus backup".format(segmentationNode.GetName())
-        backupNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", backupNodeName)
+        backupNode = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLSegmentationNode",
+            backupNodeName,
+        )
         backupNode.SetAttribute(DELETED_BACKUP_SOURCE_ATTRIBUTE, segmentationNode.GetID())
         segmentationNode.SetAttribute(DELETED_BACKUP_NODE_ATTRIBUTE, backupNode.GetID())
         self.configureDeletedBackupNode(backupNode)
@@ -1337,7 +1465,10 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
             try:
                 backupNode.SetHideFromEditors(True)
             except Exception:
-                logging.debug("Could not hide deleted backup node from editors", exc_info=True)
+                logging.debug(
+                    "Could not hide deleted backup node from editors",
+                    exc_info=True,
+                )
         backupNode.CreateDefaultDisplayNodes()
         displayNode = backupNode.GetDisplayNode()
         if displayNode:
@@ -1350,22 +1481,38 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
 
     def storeDeletedSegmentColor(self, segmentationNode, backupNode, segmentID):
         """Store a deleted segment's color on the backup node so the restore list can show it."""
-        segment = segmentationNode.GetSegmentation().GetSegment(segmentID) if segmentationNode else None
+        segment = (
+            segmentationNode.GetSegmentation().GetSegment(segmentID)
+            if segmentationNode
+            else None
+        )
         color = self.segmentColor(segment)
         if backupNode and color:
-            backupNode.SetAttribute(self.deletedSegmentColorAttributeName(segmentID), json.dumps(color))
+            backupNode.SetAttribute(
+                self.deletedSegmentColorAttributeName(segmentID),
+                json.dumps(color),
+            )
 
     def deletedSegmentColor(self, backupNode, segmentID, segment=None):
         """Return the stored or segment-defined color for a deleted segment."""
         if backupNode and segmentID:
-            storedValue = backupNode.GetAttribute(self.deletedSegmentColorAttributeName(segmentID))
+            storedValue = backupNode.GetAttribute(
+                self.deletedSegmentColorAttributeName(segmentID)
+            )
             if storedValue:
                 try:
                     color = json.loads(storedValue)
                     if len(color) >= 3:
-                        return [float(color[0]), float(color[1]), float(color[2])]
+                        return [
+                            float(color[0]),
+                            float(color[1]),
+                            float(color[2]),
+                        ]
                 except Exception:
-                    logging.debug("Could not parse deleted segment color", exc_info=True)
+                    logging.debug(
+                        "Could not parse deleted segment color",
+                        exc_info=True,
+                    )
         color = self.segmentColor(segment)
         return color if color else [0.5, 0.5, 0.5]
 
@@ -1376,13 +1523,21 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
         try:
             color = segment.GetColor()
             if color and len(color) >= 3:
-                return [float(color[0]), float(color[1]), float(color[2])]
+                return [
+                    float(color[0]),
+                    float(color[1]),
+                    float(color[2]),
+                ]
         except Exception:
             pass
         try:
             color = [0.5, 0.5, 0.5]
             segment.GetColor(color)
-            return [float(color[0]), float(color[1]), float(color[2])]
+            return [
+                float(color[0]),
+                float(color[1]),
+                float(color[2]),
+            ]
         except Exception:
             logging.debug("Could not read segment color", exc_info=True)
             return None
@@ -1423,7 +1578,10 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
         try:
             segmentIDs = json.loads(storedValue)
         except Exception:
-            logging.debug("Could not parse legacy logical delete segment list", exc_info=True)
+            logging.debug(
+                "Could not parse legacy logical delete segment list",
+                exc_info=True,
+            )
             return []
         validSegmentIDs = set(self.segmentIDs(segmentationNode))
         return [segmentID for segmentID in segmentIDs if segmentID in validSegmentIDs]
@@ -1435,10 +1593,16 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
         orderedUniqueSegmentIDs = []
         validSegmentIDs = set(self.segmentIDs(segmentationNode))
         for segmentID in segmentIDs:
-            if segmentID in validSegmentIDs and segmentID not in orderedUniqueSegmentIDs:
+            if (
+                segmentID in validSegmentIDs
+                and segmentID not in orderedUniqueSegmentIDs
+            ):
                 orderedUniqueSegmentIDs.append(segmentID)
         if orderedUniqueSegmentIDs:
-            segmentationNode.SetAttribute(LOGICALLY_DELETED_SEGMENTS_ATTRIBUTE, json.dumps(orderedUniqueSegmentIDs))
+            segmentationNode.SetAttribute(
+                LOGICALLY_DELETED_SEGMENTS_ATTRIBUTE,
+                json.dumps(orderedUniqueSegmentIDs),
+            )
         else:
             segmentationNode.SetAttribute(LOGICALLY_DELETED_SEGMENTS_ATTRIBUTE, None)
         segmentationNode.Modified()
@@ -1492,7 +1656,13 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
         except Exception:
             return False
 
-    def segmentVoxelMetrics(self, segmentationNode, segmentID, referenceVolumeNode=None, skipLengthAbovePixels=None):
+    def segmentVoxelMetrics(
+        self,
+        segmentationNode,
+        segmentID,
+        referenceVolumeNode=None,
+        skipLengthAbovePixels=None,
+    ):
         """Calculate voxel count and main-axis pixel length for one segment."""
         if not self.isValidSegmentID(segmentationNode, segmentID):
             return None
@@ -1508,14 +1678,20 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
             occupiedMask = segmentArray != 0
             volumePixels = int(np.count_nonzero(occupiedMask))
         except Exception:
-            logging.exception("Could not compute segment voxel measurements for segment: %s", segmentID)
+            logging.exception(
+                "Could not compute segment voxel measurements for segment: %s",
+                segmentID,
+            )
             return None
 
         if volumePixels == 0:
             return {"volumePixels": 0, "lengthPixels": 0}
         if volumePixels == 1:
             return {"volumePixels": volumePixels, "lengthPixels": 1}
-        if skipLengthAbovePixels is not None and volumePixels >= skipLengthAbovePixels:
+        if (
+            skipLengthAbovePixels is not None
+            and volumePixels >= skipLengthAbovePixels
+        ):
             return {"volumePixels": volumePixels, "lengthPixels": ""}
 
         occupiedVoxelCoordinates = np.argwhere(occupiedMask)
@@ -1537,19 +1713,29 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
 
     def _occupiedVoxelCoordinates(self, segmentationNode, segmentID, referenceVolumeNode, np):
         """Convert a segment labelmap into nonzero voxel coordinates."""
-        segmentArray = self._segmentArray(segmentationNode, segmentID, referenceVolumeNode)
+        segmentArray = self._segmentArray(
+            segmentationNode,
+            segmentID,
+            referenceVolumeNode,
+        )
         return np.argwhere(segmentArray != 0)
 
     def _principalAxisLengthPixels(self, occupiedVoxelCoordinates, np):
         """Estimate segment length in pixels along the principal component axis."""
-        centeredCoordinates = occupiedVoxelCoordinates - occupiedVoxelCoordinates.mean(axis=0)
+        centeredCoordinates = (
+            occupiedVoxelCoordinates - occupiedVoxelCoordinates.mean(axis=0)
+        )
         try:
             _, _, principalAxes = np.linalg.svd(centeredCoordinates, full_matrices=False)
             principalAxis = principalAxes[0]
             projectedCoordinates = occupiedVoxelCoordinates.dot(principalAxis)
             return int(round(projectedCoordinates.max() - projectedCoordinates.min() + 1))
         except Exception:
-            voxelDimensions = occupiedVoxelCoordinates.max(axis=0) - occupiedVoxelCoordinates.min(axis=0) + 1
+            voxelDimensions = (
+                occupiedVoxelCoordinates.max(axis=0)
+                - occupiedVoxelCoordinates.min(axis=0)
+                + 1
+            )
             return int(voxelDimensions.max())
 
     def isValidSegmentID(self, segmentationNode, segmentID):

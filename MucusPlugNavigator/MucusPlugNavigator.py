@@ -1927,7 +1927,7 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
                 + 1
             )
             return int(voxelDimensions.max())
-
+  
     def isValidSegmentID(self, segmentationNode, segmentID):
         """Return True if the segment ID exists in the selected segmentation."""
         if not segmentationNode or not segmentID:

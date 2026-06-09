@@ -1108,9 +1108,29 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             slicer.util.infoDisplay(message)
         except Exception as exc:
             logging.exception("Failed to export mucus plug measurements")
-            slicer.util.errorDisplay("Failed to export mucus plug measurements:\n{}".format(exc))
+            if self._isPermissionDeniedError(exc):
+                self._showExportPermissionError(filePath)
+            else:
+                slicer.util.errorDisplay(
+                    "Failed to export mucus plug measurements:\n{}".format(exc)
+                )
         finally:
             self._setExportInProgress(False)
+
+    def _isPermissionDeniedError(self, exception):
+        """Return True when export failed because the target file cannot be written."""
+        return isinstance(exception, PermissionError) or getattr(exception, "errno", None) == 13
+
+    def _showExportPermissionError(self, filePath):
+        """Show a clear export error when the CSV file is locked or read-only."""
+        slicer.util.errorDisplay(
+            (
+                "Could not replace the CSV file.\n\n"
+                "The file may already be open in Excel or another program. "
+                "Please close the CSV file, then export again.\n\n"
+                "File:\n{}"
+            ).format(filePath)
+        )
 
     def _promptForExportPath(self, segmentationName):
         """Ask the user where to save the CSV file and normalize the file extension."""

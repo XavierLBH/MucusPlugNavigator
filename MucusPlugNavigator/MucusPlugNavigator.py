@@ -1,6 +1,7 @@
 import csv
 import json
 import logging
+import re
 
 import qt
 import slicer
@@ -29,7 +30,7 @@ BUTTON_MINIMUM_WIDTH = 92
 BUTTON_MINIMUM_HEIGHT = 32
 
 JUMP_ZOOM_MINIMUM = 1.0
-JUMP_ZOOM_MAXIMUM = 20.0
+JUMP_ZOOM_MAXIMUM = 10.0
 JUMP_ZOOM_DECIMALS = 1
 JUMP_ZOOM_STEP = 0.5
 JUMP_ZOOM_DEFAULT = 1.0
@@ -859,14 +860,39 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
     def onAddButton(self, checked=False):
         """Add a segment using Segment Editor behavior, with a direct fallback."""
+        segmentationNode = self.segmentationNode()
+        previousSegmentIDs = set(self.logic.activeSegmentIDs(segmentationNode))
+
         if self._segmentEditorAddButton:
             self._runWithoutAutoJump(self._segmentEditorAddButton.click)
         else:
-            segmentationNode = self.segmentationNode()
             if segmentationNode:
                 segmentID = segmentationNode.GetSegmentation().AddEmptySegment()
                 self._setCurrentSegmentIDWithoutAutoJump(segmentID)
+
+        newSegmentID = self._newSegmentIDAfterAdd(
+            segmentationNode,
+            previousSegmentIDs,
+        )
+        self.logic.renameSegmentIfNameConflictsWithDeletedBackup(
+            segmentationNode,
+            newSegmentID,
+        )
         self.updateSegmentCountAndButtons()
+
+    def _newSegmentIDAfterAdd(self, segmentationNode, previousSegmentIDs):
+        """Return the segment ID most likely created by the last Add action."""
+        currentSegmentID = self.currentSegmentID()
+        if (
+            self.logic.isActiveSegmentID(segmentationNode, currentSegmentID)
+            and currentSegmentID not in previousSegmentIDs
+        ):
+            return currentSegmentID
+
+        for segmentID in self.logic.activeSegmentIDs(segmentationNode):
+            if segmentID not in previousSegmentIDs:
+                return segmentID
+        return ""
 
     def onShow3DButton(self, checked=False):
         """Toggle 3D visibility using Segment Editor behavior, with a direct fallback."""
@@ -1366,14 +1392,23 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
             return []
         actuallyRestoredSegmentIDs = []
         for segmentID in restoredSegmentIDs:
-            if self.copySegmentBetweenSegmentations(backupNode, segmentationNode, segmentID):
+            restoredSegmentID = self.restoreSegmentFromBackup(
+                backupNode,
+                segmentationNode,
+                segmentID,
+            )
+            if restoredSegmentID:
                 backupNode.GetSegmentation().RemoveSegment(segmentID)
                 backupNode.SetAttribute(
                     self.deletedSegmentColorAttributeName(segmentID),
                     None,
                 )
                 backupNode.Modified()
-                actuallyRestoredSegmentIDs.append(segmentID)
+                self.renameSegmentIfNameConflictsWithDeletedBackup(
+                    segmentationNode,
+                    restoredSegmentID,
+                )
+                actuallyRestoredSegmentIDs.append(restoredSegmentID)
         segmentationNode.Modified()
         self.cleanupDeletedBackupNodeIfEmpty(segmentationNode)
         return actuallyRestoredSegmentIDs
@@ -1402,7 +1437,34 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
         segmentationNode.Modified()
         return True
 
-    def copySegmentBetweenSegmentations(self, sourceSegmentationNode, targetSegmentationNode, segmentID):
+    def restoreSegmentFromBackup(self, backupNode, segmentationNode, segmentID):
+        """Restore one backup segment, using a new ID if the old ID was reused."""
+        if not self.isValidSegmentID(backupNode, segmentID):
+            return ""
+        targetSegmentation = segmentationNode.GetSegmentation() if segmentationNode else None
+        if not targetSegmentation:
+            return ""
+
+        restoredSegmentID = segmentID
+        if targetSegmentation.GetSegment(restoredSegmentID):
+            restoredSegmentID = self.uniqueSegmentID(segmentationNode, segmentID)
+
+        if self.copySegmentBetweenSegmentations(
+            backupNode,
+            segmentationNode,
+            segmentID,
+            restoredSegmentID,
+        ):
+            return restoredSegmentID
+        return ""
+
+    def copySegmentBetweenSegmentations(
+        self,
+        sourceSegmentationNode,
+        targetSegmentationNode,
+        segmentID,
+        targetSegmentID=None,
+    ):
         """Copy one segment between segmentation nodes while preserving its segment ID when possible."""
         if (
             not self.isValidSegmentID(sourceSegmentationNode, segmentID)
@@ -1413,26 +1475,134 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
         targetSegmentation = targetSegmentationNode.GetSegmentation()
         if not sourceSegmentation or not targetSegmentation:
             return False
-        if targetSegmentation.GetSegment(segmentID):
+        targetSegmentID = targetSegmentID if targetSegmentID else segmentID
+        if targetSegmentation.GetSegment(targetSegmentID):
             return True
         try:
             segmentCopy = slicer.vtkSegment()
             segmentCopy.DeepCopy(sourceSegmentation.GetSegment(segmentID))
-            targetSegmentation.AddSegment(segmentCopy, segmentID)
+            targetSegmentation.AddSegment(segmentCopy, targetSegmentID)
             targetSegmentationNode.Modified()
-            return targetSegmentation.GetSegment(segmentID) is not None
+            return targetSegmentation.GetSegment(targetSegmentID) is not None
         except Exception:
             logging.debug(
                 "vtkSegment.DeepCopy failed; trying CopySegmentFromSegmentation",
                 exc_info=True,
             )
         try:
-            targetSegmentation.CopySegmentFromSegmentation(sourceSegmentation, segmentID)
+            if targetSegmentID != segmentID and targetSegmentation.GetSegment(segmentID):
+                logging.debug(
+                    "Copy fallback skipped because the original target ID is already used: %s",
+                    segmentID,
+                )
+                return False
+            targetSegmentation.CopySegmentFromSegmentation(
+                sourceSegmentation,
+                segmentID,
+            )
             targetSegmentationNode.Modified()
-            return targetSegmentation.GetSegment(segmentID) is not None
+            copiedSegment = targetSegmentation.GetSegment(segmentID)
+            if copiedSegment and targetSegmentID != segmentID:
+                segmentCopy = slicer.vtkSegment()
+                segmentCopy.DeepCopy(copiedSegment)
+                targetSegmentation.RemoveSegment(segmentID)
+                targetSegmentation.AddSegment(segmentCopy, targetSegmentID)
+            return targetSegmentation.GetSegment(targetSegmentID) is not None
         except Exception:
             logging.exception("Could not copy segment: %s", segmentID)
             return False
+
+    def renameSegmentIfNameConflictsWithDeletedBackup(self, segmentationNode, segmentID):
+        """Rename an active segment if its name is already used or restorable."""
+        segment = self.segment(segmentationNode, segmentID)
+        if not segment:
+            return ""
+
+        reservedNames = set(self.segmentNames(segmentationNode, excludeSegmentID=segmentID))
+        reservedNames.update(self.deletedSegmentNames(segmentationNode))
+        currentName = segment.GetName()
+        if currentName not in reservedNames:
+            return currentName
+
+        uniqueName = self.nextSequentialSegmentName(currentName, reservedNames)
+        segment.SetName(uniqueName)
+        segmentationNode.Modified()
+        return uniqueName
+
+    def segment(self, segmentationNode, segmentID):
+        """Return one segment object, or None when the ID is not valid."""
+        if not segmentationNode or not segmentID:
+            return None
+        segmentation = segmentationNode.GetSegmentation()
+        return segmentation.GetSegment(segmentID) if segmentation else None
+
+    def segmentName(self, segmentationNode, segmentID):
+        """Return a display name for a segment ID."""
+        segment = self.segment(segmentationNode, segmentID)
+        if segment:
+            return segment.GetName()
+        return segmentID
+
+    def segmentNames(self, segmentationNode, excludeSegmentID=None):
+        """Return segment names in segmentation order, optionally excluding one ID."""
+        names = []
+        segmentation = segmentationNode.GetSegmentation() if segmentationNode else None
+        if not segmentation:
+            return names
+        for segmentID in self.segmentIDs(segmentationNode):
+            if segmentID == excludeSegmentID:
+                continue
+            segment = segmentation.GetSegment(segmentID)
+            if segment:
+                names.append(segment.GetName())
+        return names
+
+    def deletedSegmentNames(self, segmentationNode):
+        """Return names currently waiting in the restore backup list."""
+        backupNode = self.deletedBackupNode(segmentationNode, create=False)
+        return self.segmentNames(backupNode)
+
+    def nextSequentialSegmentName(self, requestedName, reservedNames):
+        """Return the next numbered segment name after active and restorable names."""
+        match = re.match(r"^(.*?)(\d+)$", requestedName)
+        if not match:
+            return self.uniqueSegmentName(requestedName, reservedNames)
+
+        prefix = match.group(1)
+        highestNumber = int(match.group(2))
+        for reservedName in reservedNames:
+            reservedMatch = re.match(r"^{}(\d+)$".format(re.escape(prefix)), reservedName)
+            if reservedMatch:
+                highestNumber = max(highestNumber, int(reservedMatch.group(1)))
+
+        while True:
+            highestNumber += 1
+            candidateName = "{}{}".format(prefix, highestNumber)
+            if candidateName not in reservedNames:
+                return candidateName
+
+    def uniqueSegmentName(self, requestedName, reservedNames):
+        """Return a fallback readable segment name that is not already reserved."""
+        if requestedName not in reservedNames:
+            return requestedName
+        suffix = 1
+        while True:
+            candidateName = "{}_{}".format(requestedName, suffix)
+            if candidateName not in reservedNames:
+                return candidateName
+            suffix += 1
+
+    def uniqueSegmentID(self, segmentationNode, requestedSegmentID):
+        """Return a segment ID that is not already used in the target segmentation."""
+        usedSegmentIDs = set(self.segmentIDs(segmentationNode))
+        if requestedSegmentID not in usedSegmentIDs:
+            return requestedSegmentID
+        suffix = 1
+        while True:
+            candidateSegmentID = "{}_restored_{}".format(requestedSegmentID, suffix)
+            if candidateSegmentID not in usedSegmentIDs:
+                return candidateSegmentID
+            suffix += 1
 
     def deletedBackupNode(self, segmentationNode, create=False):
         """Return the hidden segmentation node used to keep logically deleted segments restorable."""
@@ -1790,7 +1960,11 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
         """Center slice views on a segment and apply a zoom factor."""
         centerRAS = self.segmentCenterRAS(segmentationNode, segmentID)
         if centerRAS is None:
-            logging.warning("Could not find center for segment: %s", segmentID)
+            logging.warning(
+                "Could not find center for segment '%s' (ID: %s). The segment may be empty.",
+                self.segmentName(segmentationNode, segmentID),
+                segmentID,
+            )
             return
 
         self.resetSliceFieldOfViewBaseline(baseFieldOfViewBySliceNodeID)

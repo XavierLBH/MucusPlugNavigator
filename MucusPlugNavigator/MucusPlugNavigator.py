@@ -1,7 +1,10 @@
 import csv
 import json
 import logging
+import os
 import re
+import subprocess
+import sys
 
 import qt
 import slicer
@@ -19,6 +22,7 @@ SEGMENT_EDITOR_SINGLETON_TAG = "MucusPlugNavigatorSegmentEditor"
 SEGMENT_EDITOR_NODE_NAME = "MucusPlugNavigatorSegmentEditor"
 MODULE_NAME = "MucusPlugNavigator"
 MODULE_TITLE = "Mucus Plug Navigator"
+SEGMENT_NAME_LABEL_NODE_NAME = "MucusPlugNavigatorCurrentSegmentLabel"
 LOGICALLY_DELETED_SEGMENTS_ATTRIBUTE = (
     "MucusPlugNavigator.LogicallyDeletedSegmentIDs"
 )
@@ -37,6 +41,13 @@ JUMP_ZOOM_DEFAULT = 1.0
 
 
 EXPORT_MASK_MIN_VOLUME_PIXELS = 100000
+DUMMY_MODEL_SCRIPT_NAME = "dummy_mucus_model.py"
+SEGMENT_NAME_LABEL_OFFSET_MINIMUM_MM = 5.0
+SEGMENT_NAME_LABEL_OFFSET_FRACTION = 0.35
+SEGMENT_NAME_LABEL_TEXT_SCALE = 1.2
+SEGMENT_NAME_LABEL_GLYPH_SCALE = 0.05
+SEGMENT_STATUS_TAG_NAME = "Segmentation.Status"
+SEGMENT_STATUS_DONE_VALUE = "completed"
 
 ROW_MARGINS = (0, 4, 0, 4)
 GRID_HORIZONTAL_SPACING = 6
@@ -87,6 +98,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.visibilityShortcut = None
         self.lastShortcut = None
         self.nextShortcut = None
+        self.currentSegmentLabelNode = None
 
         self._moduleIsActive = False
         self._observedSegmentation = None
@@ -117,6 +129,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
     def cleanup(self):
         """Release observers and Segment Editor view hooks when Slicer unloads the module."""
+        self._removeCurrentSegmentNameLabel()
         self._removeVisibilityShortcut()
         self._removeNavigationShortcuts()
         self._removeSegmentationObservers()
@@ -142,6 +155,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
     def exit(self):
         """Remove Segment Editor view hooks when the user leaves the module."""
         self._moduleIsActive = False
+        self._hideCurrentSegmentNameLabel()
         if self.visibilityShortcut:
             self.visibilityShortcut.enabled = False
         self._setNavigationShortcutsEnabled(False)
@@ -770,6 +784,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.logic.ensureSegmentationVisible(segmentationNode)
         self._observeSegmentation(segmentationNode)
         self._selectFirstSegmentIfNeeded()
+        self._hideCurrentSegmentNameLabel()
         self.resetCurrentSegmentMeasurements()
         self.updateSegmentCountAndButtons()
 
@@ -797,6 +812,8 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
     def onObservedSegmentationChanged(self, caller=None, event=None):
         """Refresh the UI when segments are added, removed, reordered, or modified."""
         self._selectFirstSegmentIfNeeded()
+        if not self.logic.isActiveSegmentID(self.segmentationNode(), self.currentSegmentID()):
+            self._hideCurrentSegmentNameLabel()
         self.resetCurrentSegmentMeasurements()
         self.updateSegmentCountAndButtons()
 
@@ -817,9 +834,12 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
     def onLastButton(self, checked=False):
         """Select the previous segment in segmentation order and jump to it."""
         segmentationNode = self.segmentationNode()
+        currentSegmentID = self.selectedOrCurrentSegmentID()
+        if self.logic.isActiveSegmentID(segmentationNode, currentSegmentID):
+            self._setCurrentSegmentIDWithoutAutoJump(currentSegmentID)
         previousSegmentID = self.logic.previousSegmentID(
             segmentationNode,
-            self.currentSegmentID(),
+            currentSegmentID,
             wrap=True,
         )
         if not previousSegmentID:
@@ -831,13 +851,17 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
     def onNextButton(self, checked=False):
         """Select the next segment in segmentation order and jump to it."""
         segmentationNode = self.segmentationNode()
+        currentSegmentID = self.selectedOrCurrentSegmentID()
+        if self.logic.isActiveSegmentID(segmentationNode, currentSegmentID):
+            self._setCurrentSegmentIDWithoutAutoJump(currentSegmentID)
         nextSegmentID = self.logic.nextSegmentID(
             segmentationNode,
-            self.currentSegmentID(),
+            currentSegmentID,
             wrap=True,
         )
         if not nextSegmentID:
             return
+        self.logic.markSegmentDone(segmentationNode, currentSegmentID)
         self._setCurrentSegmentIDWithoutAutoJump(nextSegmentID)
         self.jumpToSegment(nextSegmentID)
         self.updateSegmentCountAndButtons()
@@ -1176,14 +1200,159 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         """Center slice views on a segment and apply the current jump zoom."""
         segmentationNode = self.segmentationNode()
         if not self.logic.isActiveSegmentID(segmentationNode, segmentID):
+            self._hideCurrentSegmentNameLabel()
             return
         self.logic.ensureSourceVolumeVisible(self.sourceVolumeNode())
-        self.logic.jumpToSegment(
+        didJump = self.logic.jumpToSegment(
             segmentationNode,
             segmentID,
             self.zoomSpinBox.value,
             self._sliceBaseFieldOfViewByID,
         )
+        if didJump:
+            self._updateCurrentSegmentNameLabel(segmentationNode, segmentID)
+        else:
+            self._hideCurrentSegmentNameLabel()
+
+    def _updateCurrentSegmentNameLabel(self, segmentationNode, segmentID):
+        """Show the current segment name near the mucus plug without covering it."""
+        labelPositionRAS = self.logic.segmentLabelPositionRAS(
+            segmentationNode,
+            segmentID,
+        )
+        if labelPositionRAS is None:
+            self._hideCurrentSegmentNameLabel()
+            return
+
+        labelNode = self._getOrCreateCurrentSegmentNameLabelNode()
+        segmentName = self.logic.segmentName(segmentationNode, segmentID)
+        segmentColor = self.logic.segmentDisplayColor(segmentationNode, segmentID)
+        self._setSingleMarkupLabelPoint(labelNode, labelPositionRAS, segmentName)
+        self._configureCurrentSegmentNameLabelDisplay(
+            labelNode,
+            visible=True,
+            color=segmentColor,
+            zoomFactor=self.zoomSpinBox.value,
+        )
+
+    def _getOrCreateCurrentSegmentNameLabelNode(self):
+        """Return the hidden singleton markups node used for the current segment label."""
+        if self.currentSegmentLabelNode:
+            return self.currentSegmentLabelNode
+
+        try:
+            self.currentSegmentLabelNode = slicer.util.getNode(
+                SEGMENT_NAME_LABEL_NODE_NAME
+            )
+        except Exception:
+            self.currentSegmentLabelNode = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLMarkupsFiducialNode",
+                SEGMENT_NAME_LABEL_NODE_NAME,
+            )
+        try:
+            self.currentSegmentLabelNode.HideFromEditorsOn()
+        except Exception:
+            logging.debug("Could not hide current segment label node", exc_info=True)
+        return self.currentSegmentLabelNode
+
+    def _setSingleMarkupLabelPoint(self, labelNode, positionRAS, labelText):
+        """Replace the label node contents with one labeled RAS point."""
+        if hasattr(labelNode, "RemoveAllControlPoints"):
+            labelNode.RemoveAllControlPoints()
+        elif hasattr(labelNode, "RemoveAllMarkups"):
+            labelNode.RemoveAllMarkups()
+
+        try:
+            labelNode.AddControlPointWorld(
+                vtk.vtkVector3d(positionRAS[0], positionRAS[1], positionRAS[2]),
+                labelText,
+            )
+        except Exception:
+            try:
+                labelNode.AddFiducial(positionRAS[0], positionRAS[1], positionRAS[2])
+            except Exception:
+                labelNode.AddFiducialFromArray(positionRAS)
+            if hasattr(labelNode, "SetNthControlPointLabel"):
+                labelNode.SetNthControlPointLabel(0, labelText)
+            elif hasattr(labelNode, "SetNthFiducialLabel"):
+                labelNode.SetNthFiducialLabel(0, labelText)
+        labelNode.SetName(SEGMENT_NAME_LABEL_NODE_NAME)
+        labelNode.Modified()
+
+    def _configureCurrentSegmentNameLabelDisplay(
+        self,
+        labelNode,
+        visible,
+        color=None,
+        zoomFactor=None,
+    ):
+        """Configure the current segment label to appear in slice views."""
+        labelNode.CreateDefaultDisplayNodes()
+        displayNode = labelNode.GetDisplayNode()
+        if not displayNode:
+            return
+        color = color if color else [1.0, 1.0, 1.0]
+        textScale = SEGMENT_NAME_LABEL_TEXT_SCALE * max(
+            float(zoomFactor) if zoomFactor else 1.0,
+            1.0,
+        )
+        displayNode.SetVisibility(bool(visible))
+        if hasattr(displayNode, "SetVisibility2D"):
+            displayNode.SetVisibility2D(bool(visible))
+        if hasattr(displayNode, "SetVisibility3D"):
+            displayNode.SetVisibility3D(False)
+        if hasattr(displayNode, "SetPointLabelsVisibility"):
+            displayNode.SetPointLabelsVisibility(True)
+        if hasattr(displayNode, "SetTextScale"):
+            displayNode.SetTextScale(textScale)
+        if hasattr(displayNode, "SetGlyphScale"):
+            displayNode.SetGlyphScale(SEGMENT_NAME_LABEL_GLYPH_SCALE)
+        self._setMarkupDisplayColor(displayNode, color)
+        self._setMarkupSliceProjection(displayNode, visible, color)
+        if hasattr(labelNode, "SetLocked"):
+            labelNode.SetLocked(True)
+        displayNode.Modified()
+
+    def _setMarkupDisplayColor(self, displayNode, color):
+        """Set markup display color using APIs available in the current Slicer."""
+        for methodName in ("SetSelectedColor", "SetColor", "SetGlyphColor"):
+            if hasattr(displayNode, methodName):
+                try:
+                    getattr(displayNode, methodName)(color[0], color[1], color[2])
+                except Exception:
+                    logging.debug("Could not set markup color", exc_info=True)
+
+    def _setMarkupSliceProjection(self, displayNode, visible, color):
+        """Enable slice projection so the label remains visible while scrolling nearby slices."""
+        if hasattr(displayNode, "SetSliceProjection"):
+            displayNode.SetSliceProjection(bool(visible))
+        if hasattr(displayNode, "SetSliceProjectionUseFiducialColor"):
+            displayNode.SetSliceProjectionUseFiducialColor(True)
+        if hasattr(displayNode, "SetSliceProjectionOutlinedBehindSlicePlane"):
+            displayNode.SetSliceProjectionOutlinedBehindSlicePlane(False)
+        if hasattr(displayNode, "SetSliceProjectionColor"):
+            displayNode.SetSliceProjectionColor(color[0], color[1], color[2])
+
+    def _hideCurrentSegmentNameLabel(self):
+        """Hide the current segment label without deleting the markups node."""
+        labelNode = self.currentSegmentLabelNode
+        if not labelNode:
+            try:
+                labelNode = slicer.util.getNode(SEGMENT_NAME_LABEL_NODE_NAME)
+            except Exception:
+                return
+        self._configureCurrentSegmentNameLabelDisplay(labelNode, visible=False)
+
+    def _removeCurrentSegmentNameLabel(self):
+        """Delete the current segment label node during module cleanup."""
+        labelNode = self.currentSegmentLabelNode
+        if not labelNode:
+            try:
+                labelNode = slicer.util.getNode(SEGMENT_NAME_LABEL_NODE_NAME)
+            except Exception:
+                return
+        slicer.mrmlScene.RemoveNode(labelNode)
+        self.currentSegmentLabelNode = None
 
     def segmentationNode(self):
         """Return the selected mucus segmentation node."""
@@ -1198,6 +1367,38 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         if not self.segmentEditorWidget:
             return ""
         return self.segmentEditorWidget.currentSegmentID()
+
+    def selectedOrCurrentSegmentID(self):
+        """Return the selected table segment ID, falling back to Segment Editor current ID."""
+        segmentationNode = self.segmentationNode()
+        selectedSegmentID = self.selectedSegmentIDFromSegmentTable()
+        if self.logic.isActiveSegmentID(segmentationNode, selectedSegmentID):
+            return selectedSegmentID
+        return self.currentSegmentID()
+
+    def selectedSegmentIDFromSegmentTable(self):
+        """Return the first selected segment ID from the embedded segment table."""
+        segmentTable = self.segmentTableView()
+        if not segmentTable or not hasattr(segmentTable, "selectedSegmentIDs"):
+            return ""
+        try:
+            selectedSegmentIDs = segmentTable.selectedSegmentIDs()
+        except Exception:
+            logging.debug("Could not read selected segment IDs from table", exc_info=True)
+            return ""
+        return str(selectedSegmentIDs[0]) if selectedSegmentIDs else ""
+
+    def segmentTableView(self):
+        """Return the embedded qMRMLSegmentsTableView when it can be found."""
+        if not self.segmentEditorWidget:
+            return None
+        for child in self.segmentEditorWidget.findChildren(qt.QWidget):
+            try:
+                if child.metaObject().className() == "qMRMLSegmentsTableView":
+                    return child
+            except Exception:
+                continue
+        return None
 
     def updateSegmentCountAndButtons(self):
         """Refresh count text and enable or disable buttons based on current selection."""
@@ -1337,6 +1538,54 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
     """Keep non-UI calculations and MRML operations separate from the widget."""
 
+    def runDummyMucusModelTest(self, pythonExecutable=None, caseID="dummy_case"):
+        """Run the bundled dummy mucus model script as an external process."""
+        scriptPath = self.dummyMucusModelScriptPath()
+        pythonExecutable = (
+            pythonExecutable
+            if pythonExecutable
+            else self.defaultPythonExecutableForExternalScripts()
+        )
+        command = [
+            pythonExecutable,
+            scriptPath,
+            "--case-id",
+            caseID,
+        ]
+        return self.runExternalProcess(command)
+
+    def dummyMucusModelScriptPath(self):
+        """Return the absolute path to the bundled dummy model script."""
+        return os.path.join(os.path.dirname(__file__), DUMMY_MODEL_SCRIPT_NAME)
+
+    def defaultPythonExecutableForExternalScripts(self):
+        """Return the best Python executable for launching helper scripts."""
+        try:
+            slicerApplicationPath = slicer.app.applicationFilePath()
+            slicerApplicationFolder = os.path.dirname(slicerApplicationPath)
+            pythonSlicerName = "PythonSlicer.exe" if os.name == "nt" else "PythonSlicer"
+            pythonSlicerPath = os.path.join(slicerApplicationFolder, pythonSlicerName)
+            if os.path.exists(pythonSlicerPath):
+                return pythonSlicerPath
+        except Exception:
+            logging.debug("Could not find PythonSlicer executable", exc_info=True)
+        return sys.executable
+
+    def runExternalProcess(self, command):
+        """Run an external command and return stdout, stderr, and exit code."""
+        completedProcess = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return {
+            "command": command,
+            "returnCode": completedProcess.returncode,
+            "stdout": completedProcess.stdout,
+            "stderr": completedProcess.stderr,
+        }
+
     def segmentIDs(self, segmentationNode):
         """Return segment IDs in the same order used by the segmentation node."""
         if not segmentationNode:
@@ -1352,6 +1601,85 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
     def segmentCount(self, segmentationNode):
         """Return the number of mucus plug segments in the selected segmentation."""
         return len(self.segmentIDs(segmentationNode))
+
+    def markSegmentDone(self, segmentationNode, segmentID):
+        """Mark one segment as completed in Slicer's segment status column."""
+        segment = self.segment(segmentationNode, segmentID)
+        if not segment:
+            return False
+
+        try:
+            segment.SetTag(SEGMENT_STATUS_TAG_NAME, SEGMENT_STATUS_DONE_VALUE)
+            if hasattr(segment, "Modified"):
+                segment.Modified()
+            segmentation = segmentationNode.GetSegmentation() if segmentationNode else None
+            if segmentation and hasattr(segmentation, "Modified"):
+                segmentation.Modified()
+            segmentationNode.Modified()
+            return True
+        except Exception:
+            logging.debug("Could not mark segment as done", exc_info=True)
+            return False
+
+    def segmentStatusTagNames(self, segment=None):
+        """Return possible tag names Slicer may use for the segment status flag."""
+        tagNames = []
+        tagOwnerCandidates = [
+            getattr(slicer, "vtkSegment", None),
+            segment,
+        ]
+        for tagOwner in tagOwnerCandidates:
+            if not tagOwner:
+                continue
+            for methodName in ("GetStatusTagName", "GetSegmentStatusTagName"):
+                if hasattr(tagOwner, methodName):
+                    try:
+                        tagNames.append(getattr(tagOwner, methodName)())
+                    except Exception:
+                        logging.debug("Could not read segment status tag name", exc_info=True)
+        tagNames.append(SEGMENT_STATUS_TAG_NAME)
+        return list(dict.fromkeys([tagName for tagName in tagNames if tagName]))
+
+    def segmentStatusDebugRows(self, segmentationNode):
+        """Return current status tag values for all segments for Slicer-console debugging."""
+        rows = []
+        segmentation = segmentationNode.GetSegmentation() if segmentationNode else None
+        if not segmentation:
+            return rows
+
+        for segmentID in self.segmentIDs(segmentationNode):
+            segment = segmentation.GetSegment(segmentID)
+            row = {
+                "segmentID": segmentID,
+                "segmentName": segment.GetName() if segment else segmentID,
+                "statusTags": {},
+            }
+            for tagName in self.segmentStatusTagNames(segment):
+                tagValue = self.segmentTagValue(segment, tagName)
+                if tagValue not in (None, ""):
+                    row["statusTags"][tagName] = tagValue
+            rows.append(row)
+        return rows
+
+    def segmentTagValue(self, segment, tagName):
+        """Read one segment tag value across Slicer Python wrapping variants."""
+        if not segment or not tagName:
+            return None
+        try:
+            return segment.GetTag(tagName)
+        except TypeError:
+            pass
+        except Exception:
+            logging.debug("Could not read segment tag value", exc_info=True)
+            return None
+
+        try:
+            tagValue = ""
+            if segment.GetTag(tagName, tagValue):
+                return tagValue
+        except Exception:
+            logging.debug("Could not read segment tag value by reference", exc_info=True)
+        return None
 
     def activeSegmentIDs(self, segmentationNode):
         """Return segment IDs currently present in the active segmentation."""
@@ -1562,6 +1890,24 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
         if segment:
             return segment.GetName()
         return segmentID
+
+    def segmentDisplayColor(self, segmentationNode, segmentID):
+        """Return the visible RGB color for one segment."""
+        if segmentationNode and segmentID:
+            displayNode = segmentationNode.GetDisplayNode()
+            if displayNode and hasattr(displayNode, "GetSegmentOverrideColor"):
+                color = [0.0, 0.0, 0.0]
+                try:
+                    if displayNode.GetSegmentOverrideColor(segmentID, color):
+                        return [
+                            float(color[0]),
+                            float(color[1]),
+                            float(color[2]),
+                        ]
+                except Exception:
+                    logging.debug("Could not read segment override color", exc_info=True)
+        color = self.segmentColor(self.segment(segmentationNode, segmentID))
+        return color if color else [1.0, 1.0, 1.0]
 
     def segmentNames(self, segmentationNode, excludeSegmentID=None):
         """Return segment names in segmentation order, optionally excluding one ID."""
@@ -1927,7 +2273,7 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
                 + 1
             )
             return int(voxelDimensions.max())
-  
+
     def isValidSegmentID(self, segmentationNode, segmentID):
         """Return True if the segment ID exists in the selected segmentation."""
         if not segmentationNode or not segmentID:
@@ -1985,13 +2331,14 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
                 self.segmentName(segmentationNode, segmentID),
                 segmentID,
             )
-            return
+            return False
 
         self.resetSliceFieldOfViewBaseline(baseFieldOfViewBySliceNodeID)
         for sliceNode in slicer.util.getNodesByClass("vtkMRMLSliceNode"):
             sliceNode.JumpSliceByCentering(centerRAS[0], centerRAS[1], centerRAS[2])
 
         self.applySliceZoom(zoomFactor, baseFieldOfViewBySliceNodeID)
+        return True
 
     def segmentCenterRAS(self, segmentationNode, segmentID):
         """Return the RAS center point for a segment."""
@@ -2005,6 +2352,51 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
         if centerRAS is None or len(centerRAS) < 3:
             return None
         return [float(centerRAS[0]), float(centerRAS[1]), float(centerRAS[2])]
+
+    def segmentLabelPositionRAS(self, segmentationNode, segmentID):
+        """Return an RAS label point near, but outside, the segment bounds."""
+        centerRAS = self.segmentCenterRAS(segmentationNode, segmentID)
+        if centerRAS is None:
+            return None
+
+        boundsRAS = self.segmentBoundsRAS(segmentationNode, segmentID)
+        if boundsRAS is None:
+            return [
+                centerRAS[0] + SEGMENT_NAME_LABEL_OFFSET_MINIMUM_MM,
+                centerRAS[1] + SEGMENT_NAME_LABEL_OFFSET_MINIMUM_MM,
+                centerRAS[2],
+            ]
+
+        dimensions = [
+            max(boundsRAS[1] - boundsRAS[0], 0.0),
+            max(boundsRAS[3] - boundsRAS[2], 0.0),
+            max(boundsRAS[5] - boundsRAS[4], 0.0),
+        ]
+        margin = max(
+            max(dimensions) * SEGMENT_NAME_LABEL_OFFSET_FRACTION,
+            SEGMENT_NAME_LABEL_OFFSET_MINIMUM_MM,
+        )
+        return [
+            boundsRAS[1] + margin,
+            centerRAS[1],
+            centerRAS[2],
+        ]
+
+    def segmentBoundsRAS(self, segmentationNode, segmentID):
+        """Return segment bounds in RAS coordinates when Slicer can calculate them."""
+        if not self.isValidSegmentID(segmentationNode, segmentID):
+            return None
+        boundsRAS = [0.0] * 6
+        try:
+            segmentationNode.GetSegmentBounds(segmentID, boundsRAS)
+        except Exception:
+            logging.debug("Could not get segment bounds for label placement", exc_info=True)
+            return None
+        if boundsRAS[0] > boundsRAS[1] or boundsRAS[2] > boundsRAS[3]:
+            return None
+        if boundsRAS[4] > boundsRAS[5]:
+            return None
+        return [float(value) for value in boundsRAS]
 
     def applySliceZoom(self, zoomFactor, baseFieldOfViewBySliceNodeID):
         """Apply the zoom factor by reducing each slice view field-of-view."""

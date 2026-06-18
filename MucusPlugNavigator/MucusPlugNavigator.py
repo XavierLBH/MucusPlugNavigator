@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 import qt
 import slicer
@@ -23,6 +24,8 @@ SEGMENT_EDITOR_NODE_NAME = "MucusPlugNavigatorSegmentEditor"
 MODULE_NAME = "MucusPlugNavigator"
 MODULE_TITLE = "Mucus Plug Navigator"
 SEGMENT_NAME_LABEL_NODE_NAME = "MucusPlugNavigatorCurrentSegmentLabel"
+SEGMENT_NAME_LABEL_NODE_PREFIX = "MucusPlugNavigatorVisibleSegmentLabel_"
+SEGMENT_NAME_LABEL_VIEW_NODE_ATTRIBUTE = "MucusPlugNavigator.LabelViewNodeID"
 LOGICALLY_DELETED_SEGMENTS_ATTRIBUTE = (
     "MucusPlugNavigator.LogicallyDeletedSegmentIDs"
 )
@@ -44,8 +47,13 @@ EXPORT_MASK_MIN_VOLUME_PIXELS = 100000
 DUMMY_MODEL_SCRIPT_NAME = "dummy_mucus_model.py"
 SEGMENT_NAME_LABEL_OFFSET_MINIMUM_MM = 5.0
 SEGMENT_NAME_LABEL_OFFSET_FRACTION = 0.35
-SEGMENT_NAME_LABEL_TEXT_SCALE = 1.2
+SEGMENT_NAME_LABEL_TEXT_SCALE = 1.0
 SEGMENT_NAME_LABEL_GLYPH_SCALE = 0.05
+SEGMENT_NAME_LABEL_SLICE_TOLERANCE_MM = 5.0
+SEGMENT_NAME_LABEL_UPDATE_DELAY_MS = 50
+SEGMENT_NAME_LABEL_CACHE_BUILD_LIMIT = 4
+SEGMENT_NAME_LABEL_DEBUG = True
+SLICE_CHANGE_POLL_INTERVAL_MS = 250
 SEGMENT_STATUS_TAG_NAME = "Segmentation.Status"
 SEGMENT_STATUS_DONE_VALUE = "completed"
 
@@ -99,16 +107,28 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.lastShortcut = None
         self.nextShortcut = None
         self.currentSegmentLabelNode = None
+        self.segmentNameLabelNodesBySegmentID = {}
+        self.labelUpdateTimer = None
+        self.labelCacheBuildTimer = None
+        self.sliceChangePollTimer = None
+        self._scheduledLabelRefreshAllowCacheBuild = False
 
         self._moduleIsActive = False
         self._observedSegmentation = None
         self._segmentationObserverTags = []
         self._observedDisplayNode = None
         self._displayNodeObserverTags = []
+        self._observedSliceNodes = []
+        self._sliceNodeObserverTags = []
+        self._observedSliceViews = []
+        self._sliceViewEventFiltersSupported = True
+        self._lastSliceStateSignature = None
         self._sliceBaseFieldOfViewByID = {}
         self._segmentEditorAddButton = None
         self._segmentEditorShow3DButton = None
         self._suppressAutoJump = False
+        self._suppressSliceLabelRefresh = False
+        self._sliceLabelRefreshInProgress = False
 
         self._initializeWidgetReferences()
 
@@ -122,14 +142,20 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self._buildNavigationSection()
         self._buildActionToolbarSection()
         self._buildEmbeddedSegmentEditorSection()
+        self._createLabelUpdateTimer()
+        self._createSliceChangePollTimer()
         self._createVisibilityShortcut()
         self._createNavigationShortcuts()
         self._connectSignals()
         self._initializeWidgetState()
+        self._startSliceChangePolling()
 
     def cleanup(self):
         """Release observers and Segment Editor view hooks when Slicer unloads the module."""
         self._removeCurrentSegmentNameLabel()
+        self._removeSliceNodeObservers()
+        self._removeSliceViewEventFilters()
+        self._stopSliceChangePolling()
         self._removeVisibilityShortcut()
         self._removeNavigationShortcuts()
         self._removeSegmentationObservers()
@@ -143,6 +169,9 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
     def enter(self):
         """Install Segment Editor view hooks when the module becomes active."""
         self._moduleIsActive = True
+        self._observeSliceNodes()
+        self._observeSliceViews()
+        self._startSliceChangePolling()
         if self.visibilityShortcut:
             self.visibilityShortcut.enabled = True
         self._setNavigationShortcutsEnabled(True)
@@ -151,11 +180,15 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             self.segmentEditorWidget.setupViewObservations()
             self.segmentEditorWidget.installKeyboardShortcuts()
             self.updateSegmentCountAndButtons()
+            self.refreshVisibleSegmentNameLabels()
 
     def exit(self):
         """Remove Segment Editor view hooks when the user leaves the module."""
         self._moduleIsActive = False
         self._hideCurrentSegmentNameLabel()
+        self._removeSliceNodeObservers()
+        self._removeSliceViewEventFilters()
+        self._stopSliceChangePolling()
         if self.visibilityShortcut:
             self.visibilityShortcut.enabled = False
         self._setNavigationShortcutsEnabled(False)
@@ -397,6 +430,28 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         button = qt.QPushButton(text)
         button.setToolTip(toolTip)
         return button
+
+    def _createLabelUpdateTimer(self):
+        """Create a short timer so scrolling updates labels without over-refreshing."""
+        self.labelUpdateTimer = qt.QTimer()
+        self.labelUpdateTimer.setSingleShot(True)
+        self.labelUpdateTimer.setInterval(SEGMENT_NAME_LABEL_UPDATE_DELAY_MS)
+        self.labelUpdateTimer.connect("timeout()", self.onLabelUpdateTimerTimeout)
+
+        self.labelCacheBuildTimer = qt.QTimer()
+        self.labelCacheBuildTimer.setSingleShot(True)
+        self.labelCacheBuildTimer.setInterval(SEGMENT_NAME_LABEL_UPDATE_DELAY_MS)
+        self.labelCacheBuildTimer.connect(
+            "timeout()",
+            self.onLabelCacheBuildTimerTimeout,
+        )
+
+    def _createSliceChangePollTimer(self):
+        """Create a polling fallback for slice changes that do not emit events here."""
+        self.sliceChangePollTimer = qt.QTimer()
+        self.sliceChangePollTimer.setSingleShot(False)
+        self.sliceChangePollTimer.setInterval(SLICE_CHANGE_POLL_INTERVAL_MS)
+        self.sliceChangePollTimer.connect("timeout()", self.onSliceChangePollTimer)
 
     def _createVisibilityShortcut(self):
         """Bind the H key to the whole-segmentation visibility button."""
@@ -780,6 +835,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
     def onSegmentationNodeChanged(self, segmentationNode):
         """Update Segment Editor and observers when the selected segmentation changes."""
+        self.ensureSliceChangeMonitoringActive()
         self.segmentEditorWidget.setSegmentationNode(segmentationNode)
         self.logic.ensureSegmentationVisible(segmentationNode)
         self._observeSegmentation(segmentationNode)
@@ -787,9 +843,11 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self._hideCurrentSegmentNameLabel()
         self.resetCurrentSegmentMeasurements()
         self.updateSegmentCountAndButtons()
+        self.refreshVisibleSegmentNameLabels()
 
     def onSourceVolumeNodeChanged(self, sourceVolumeNode):
         """Update Segment Editor and slice background when the source CT volume changes."""
+        self.ensureSliceChangeMonitoringActive()
         if hasattr(self.segmentEditorWidget, "setSourceVolumeNode"):
             self.segmentEditorWidget.setSourceVolumeNode(sourceVolumeNode)
         else:
@@ -816,12 +874,31 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             self._hideCurrentSegmentNameLabel()
         self.resetCurrentSegmentMeasurements()
         self.updateSegmentCountAndButtons()
+        self.refreshVisibleSegmentNameLabels()
 
     def onZoomChanged(self, value):
-        """Reapply jump zoom to the current segment when the zoom value changes."""
-        segmentID = self.currentSegmentID()
-        if self.logic.isValidSegmentID(self.segmentationNode(), segmentID):
-            self.jumpToSegment(segmentID)
+        """Apply slice zoom and resize labels without recalculating visible segment IDs."""
+        self._suppressSliceLabelRefresh = True
+        try:
+            self.logic.ensureSliceFieldOfViewBaseline(self._sliceBaseFieldOfViewByID)
+            self.logic.applySliceZoom(value, self._sliceBaseFieldOfViewByID)
+            self.updateVisibleSegmentNameLabelTextScale(value)
+        finally:
+            qt.QTimer.singleShot(100, self._clearSliceLabelRefreshSuppression)
+
+    def _clearSliceLabelRefreshSuppression(self):
+        """Allow slice scrolling to refresh labels after a zoom-only change finishes."""
+        self._suppressSliceLabelRefresh = False
+
+    def updateVisibleSegmentNameLabelTextScale(self, zoomFactor):
+        """Resize existing segment-name labels without recalculating visible segments."""
+        textScale = SEGMENT_NAME_LABEL_TEXT_SCALE * max(float(zoomFactor), 1.0)
+        for labelNode in self._allSegmentNameLabelNodes():
+            displayNode = labelNode.GetDisplayNode() if labelNode else None
+            if not displayNode or not hasattr(displayNode, "SetTextScale"):
+                continue
+            displayNode.SetTextScale(textScale)
+            displayNode.Modified()
 
     def onJumpButton(self, checked=False):
         """Jump slice views to the currently selected segment."""
@@ -939,6 +1016,10 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             return None
         visible = not self.logic.isSegmentationVisible(segmentationNode)
         self.logic.setSegmentationVisible(segmentationNode, visible)
+        if visible:
+            self.refreshVisibleSegmentNameLabels()
+        else:
+            self._hideCurrentSegmentNameLabel()
         self.updateSegmentCountAndButtons()
         return visible
 
@@ -1203,19 +1284,234 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             self._hideCurrentSegmentNameLabel()
             return
         self.logic.ensureSourceVolumeVisible(self.sourceVolumeNode())
-        didJump = self.logic.jumpToSegment(
-            segmentationNode,
-            segmentID,
-            self.zoomSpinBox.value,
-            self._sliceBaseFieldOfViewByID,
-        )
+        self._suppressSliceLabelRefresh = True
+        try:
+            didJump = self.logic.jumpToSegment(
+                segmentationNode,
+                segmentID,
+                self.zoomSpinBox.value,
+                self._sliceBaseFieldOfViewByID,
+            )
+        finally:
+            self._suppressSliceLabelRefresh = False
         if didJump:
-            self._updateCurrentSegmentNameLabel(segmentationNode, segmentID)
+            self.refreshVisibleSegmentNameLabelsAfterSliceChange()
         else:
             self._hideCurrentSegmentNameLabel()
 
+    def refreshVisibleSegmentNameLabelsAfterSliceChange(self):
+        """Run the complete current-slice segment-label decision after any slice move."""
+        self.refreshVisibleSegmentNameLabelsForSliceNodes(
+            self.currentSliceNodes(),
+            reason="slice change full check",
+        )
+
+    def refreshVisibleSegmentNameLabelsForSliceNode(self, sliceNode, reason):
+        """Refresh labels only for one changed slice view."""
+        if not sliceNode:
+            self.refreshVisibleSegmentNameLabelsAfterSliceChange()
+            return
+        self.refreshVisibleSegmentNameLabelsForSliceNodes(
+            [sliceNode],
+            reason=reason,
+            viewNodeIDToReplace=sliceNode.GetID(),
+        )
+
+    def refreshVisibleSegmentNameLabelsForSliceNodes(
+        self,
+        sliceNodes,
+        reason,
+        viewNodeIDToReplace=None,
+    ):
+        """Run the label decision for the provided slice nodes."""
+        self.ensureSliceChangeMonitoringActive()
+        if self._sliceLabelRefreshInProgress:
+            self.debugSegmentLabelMessage("skip full check: refresh already running")
+            return
+        self._sliceLabelRefreshInProgress = True
+        try:
+            self.refreshVisibleSegmentNameLabels(
+                allowCacheBuild=True,
+                schedulePending=False,
+                cacheBuildLimit=None,
+                reason=reason,
+                sliceNodes=sliceNodes,
+                viewNodeIDToReplace=viewNodeIDToReplace,
+            )
+            self._lastSliceStateSignature = self.currentSliceStateSignature()
+        finally:
+            self._sliceLabelRefreshInProgress = False
+
     def _updateCurrentSegmentNameLabel(self, segmentationNode, segmentID):
-        """Show the current segment name near the mucus plug without covering it."""
+        """Refresh visible segment labels; kept as a compatibility wrapper."""
+        self.refreshVisibleSegmentNameLabels()
+
+    def refreshVisibleSegmentNameLabels(
+        self,
+        allowCacheBuild=False,
+        schedulePending=True,
+        cacheBuildLimit=SEGMENT_NAME_LABEL_CACHE_BUILD_LIMIT,
+        reason="refresh",
+        sliceNodes=None,
+        viewNodeIDToReplace=None,
+    ):
+        """Show labels for active segments intersecting the current slice views."""
+        startTime = time.time()
+        segmentationNode = self.segmentationNode()
+        if (
+            not segmentationNode
+            or not self.logic.isSegmentationVisible(segmentationNode)
+        ):
+            self.debugSegmentLabelMessage(
+                "{}: hide labels because segmentation is missing or hidden".format(
+                    reason
+                )
+            )
+            self._hideCurrentSegmentNameLabel()
+            return
+
+        self.debugSegmentLabelMessage(
+            "{}: start label check allowCacheBuild={} cacheBuildLimit={}".format(
+                reason,
+                allowCacheBuild,
+                cacheBuildLimit,
+            )
+        )
+        labelEntries = self.logic.visibleSegmentLabelEntries(
+            segmentationNode,
+            sliceNodes if sliceNodes is not None else self.currentSliceNodes(),
+            self.sourceVolumeNode(),
+            allowCacheBuild=allowCacheBuild,
+            cacheBuildLimit=cacheBuildLimit,
+        )
+        debugSummary = self.logic.lastSegmentLabelDebugSummary()
+        elapsedSeconds = time.time() - startTime
+        self.debugSegmentLabelMessage(
+            "{}: finished in {:.3f}s; labels={}; {}".format(
+                reason,
+                elapsedSeconds,
+                len(labelEntries),
+                debugSummary,
+            )
+        )
+        if not labelEntries:
+            if self.sourceVolumeNode():
+                if schedulePending and self.logic.segmentLabelCacheBuildPending():
+                    self.debugSegmentLabelMessage(
+                        "{}: no labels yet; cache build pending".format(reason)
+                    )
+                    self.scheduleSegmentLabelCacheBuild()
+                    return
+                self.debugSegmentLabelMessage(
+                    "{}: hide labels because full check found 0 labels".format(reason)
+                )
+                self._hideSegmentNameLabelsForView(viewNodeIDToReplace)
+                return
+            fallbackSegmentID = self.selectedOrCurrentSegmentID()
+            if self.logic.isActiveSegmentID(segmentationNode, fallbackSegmentID):
+                self._showSingleSegmentNameLabel(segmentationNode, fallbackSegmentID)
+            return
+        if not self.logic.segmentLabelCacheBuildPending():
+            self._hideSegmentNameLabelsForView(viewNodeIDToReplace)
+        for labelEntry in labelEntries:
+            labelNode = self._getOrCreateSegmentNameLabelNode(labelEntry["labelID"])
+            self._setSingleMarkupLabelPoint(
+                labelNode,
+                labelEntry["positionRAS"],
+                labelEntry["segmentName"],
+            )
+            self._configureCurrentSegmentNameLabelDisplay(
+                labelNode,
+                visible=True,
+                color=labelEntry["color"],
+                zoomFactor=self.zoomSpinBox.value,
+                viewNodeID=labelEntry["viewNodeID"],
+            )
+        if schedulePending and self.logic.segmentLabelCacheBuildPending():
+            self.scheduleSegmentLabelCacheBuild()
+
+    def debugSegmentLabelMessage(self, message):
+        """Print label-refresh diagnostics to the Slicer console."""
+        if not SEGMENT_NAME_LABEL_DEBUG:
+            return
+        fullMessage = "[MucusPlugNavigator label debug] {}".format(message)
+        print(fullMessage)
+        logging.info(fullMessage)
+
+    def scheduleVisibleSegmentNameLabelRefresh(
+        self,
+        force=False,
+        allowCacheBuild=False,
+    ):
+        """Refresh visible labels after slice movement settles."""
+        if self._moduleIsActive and self.labelUpdateTimer:
+            if self.labelUpdateTimer.isActive() and not force:
+                return
+            self._scheduledLabelRefreshAllowCacheBuild = allowCacheBuild
+            self.labelUpdateTimer.start()
+        else:
+            self.refreshVisibleSegmentNameLabels(allowCacheBuild=allowCacheBuild)
+
+    def onLabelUpdateTimerTimeout(self):
+        """Refresh labels from the timer using the scheduled cache-build mode."""
+        self.refreshVisibleSegmentNameLabels(
+            allowCacheBuild=self._scheduledLabelRefreshAllowCacheBuild,
+        )
+
+    def scheduleSegmentLabelCacheBuild(self, force=False):
+        """Schedule a small background chunk to build missing segment-label cache."""
+        if self._moduleIsActive and self.labelCacheBuildTimer:
+            if self.labelCacheBuildTimer.isActive() and not force:
+                return
+            self.labelCacheBuildTimer.start()
+        else:
+            self.refreshVisibleSegmentNameLabels(
+                allowCacheBuild=True,
+                schedulePending=True,
+                cacheBuildLimit=SEGMENT_NAME_LABEL_CACHE_BUILD_LIMIT,
+            )
+
+    def onLabelCacheBuildTimerTimeout(self):
+        """Build a small cache chunk, then refresh labels for the current slice."""
+        self.refreshVisibleSegmentNameLabels(
+            allowCacheBuild=True,
+            schedulePending=True,
+            cacheBuildLimit=SEGMENT_NAME_LABEL_CACHE_BUILD_LIMIT,
+        )
+
+    def _getOrCreateSegmentNameLabelNode(self, segmentID):
+        """Return a hidden singleton markups node for one segment label."""
+        if segmentID in self.segmentNameLabelNodesBySegmentID:
+            return self.segmentNameLabelNodesBySegmentID[segmentID]
+
+        labelNodeName = self._segmentNameLabelNodeName(segmentID)
+        try:
+            labelNode = slicer.util.getNode(labelNodeName)
+        except Exception:
+            labelNode = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLMarkupsFiducialNode",
+                labelNodeName,
+            )
+        try:
+            labelNode.HideFromEditorsOn()
+        except Exception:
+            logging.debug("Could not hide segment label node", exc_info=True)
+        self.segmentNameLabelNodesBySegmentID[segmentID] = labelNode
+        return labelNode
+
+    def _segmentNameLabelNodeName(self, segmentID):
+        """Return the markups node name used for one segment label."""
+        safeSegmentID = re.sub(r"[^A-Za-z0-9_]+", "_", str(segmentID))
+        return "{}{}".format(SEGMENT_NAME_LABEL_NODE_PREFIX, safeSegmentID)
+
+    def _getOrCreateCurrentSegmentNameLabelNode(self):
+        """Return the legacy current-segment label node for older call paths."""
+        labelNode = self._getOrCreateSegmentNameLabelNode("current")
+        self.currentSegmentLabelNode = labelNode
+        return labelNode
+
+    def _showSingleSegmentNameLabel(self, segmentationNode, segmentID):
+        """Show one segment label near the mucus plug without covering it."""
         labelPositionRAS = self.logic.segmentLabelPositionRAS(
             segmentationNode,
             segmentID,
@@ -1224,7 +1520,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             self._hideCurrentSegmentNameLabel()
             return
 
-        labelNode = self._getOrCreateCurrentSegmentNameLabelNode()
+        labelNode = self._getOrCreateSegmentNameLabelNode(segmentID)
         segmentName = self.logic.segmentName(segmentationNode, segmentID)
         segmentColor = self.logic.segmentDisplayColor(segmentationNode, segmentID)
         self._setSingleMarkupLabelPoint(labelNode, labelPositionRAS, segmentName)
@@ -1234,26 +1530,6 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             color=segmentColor,
             zoomFactor=self.zoomSpinBox.value,
         )
-
-    def _getOrCreateCurrentSegmentNameLabelNode(self):
-        """Return the hidden singleton markups node used for the current segment label."""
-        if self.currentSegmentLabelNode:
-            return self.currentSegmentLabelNode
-
-        try:
-            self.currentSegmentLabelNode = slicer.util.getNode(
-                SEGMENT_NAME_LABEL_NODE_NAME
-            )
-        except Exception:
-            self.currentSegmentLabelNode = slicer.mrmlScene.AddNewNodeByClass(
-                "vtkMRMLMarkupsFiducialNode",
-                SEGMENT_NAME_LABEL_NODE_NAME,
-            )
-        try:
-            self.currentSegmentLabelNode.HideFromEditorsOn()
-        except Exception:
-            logging.debug("Could not hide current segment label node", exc_info=True)
-        return self.currentSegmentLabelNode
 
     def _setSingleMarkupLabelPoint(self, labelNode, positionRAS, labelText):
         """Replace the label node contents with one labeled RAS point."""
@@ -1276,7 +1552,10 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
                 labelNode.SetNthControlPointLabel(0, labelText)
             elif hasattr(labelNode, "SetNthFiducialLabel"):
                 labelNode.SetNthFiducialLabel(0, labelText)
-        labelNode.SetName(SEGMENT_NAME_LABEL_NODE_NAME)
+        if hasattr(labelNode, "SetNthControlPointVisibility"):
+            labelNode.SetNthControlPointVisibility(0, True)
+        if hasattr(labelNode, "SetDisplayVisibility"):
+            labelNode.SetDisplayVisibility(True)
         labelNode.Modified()
 
     def _configureCurrentSegmentNameLabelDisplay(
@@ -1285,6 +1564,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         visible,
         color=None,
         zoomFactor=None,
+        viewNodeID=None,
     ):
         """Configure the current segment label to appear in slice views."""
         labelNode.CreateDefaultDisplayNodes()
@@ -1296,11 +1576,13 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             float(zoomFactor) if zoomFactor else 1.0,
             1.0,
         )
+        if hasattr(labelNode, "SetDisplayVisibility"):
+            labelNode.SetDisplayVisibility(bool(visible))
         displayNode.SetVisibility(bool(visible))
         if hasattr(displayNode, "SetVisibility2D"):
             displayNode.SetVisibility2D(bool(visible))
         if hasattr(displayNode, "SetVisibility3D"):
-            displayNode.SetVisibility3D(False)
+            displayNode.SetVisibility3D(bool(visible))
         if hasattr(displayNode, "SetPointLabelsVisibility"):
             displayNode.SetPointLabelsVisibility(True)
         if hasattr(displayNode, "SetTextScale"):
@@ -1308,9 +1590,12 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         if hasattr(displayNode, "SetGlyphScale"):
             displayNode.SetGlyphScale(SEGMENT_NAME_LABEL_GLYPH_SCALE)
         self._setMarkupDisplayColor(displayNode, color)
+        self._setSegmentNameLabelViewAttribute(labelNode, viewNodeID)
         self._setMarkupSliceProjection(displayNode, visible, color)
+        self._setMarkupViewRestriction(displayNode, viewNodeID)
         if hasattr(labelNode, "SetLocked"):
-            labelNode.SetLocked(True)
+            labelNode.SetLocked(False)
+        labelNode.Modified()
         displayNode.Modified()
 
     def _setMarkupDisplayColor(self, displayNode, color):
@@ -1323,9 +1608,9 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
                     logging.debug("Could not set markup color", exc_info=True)
 
     def _setMarkupSliceProjection(self, displayNode, visible, color):
-        """Enable slice projection so the label remains visible while scrolling nearby slices."""
+        """Disable slice projection so labels only show on slices with visible pixels."""
         if hasattr(displayNode, "SetSliceProjection"):
-            displayNode.SetSliceProjection(bool(visible))
+            displayNode.SetSliceProjection(False)
         if hasattr(displayNode, "SetSliceProjectionUseFiducialColor"):
             displayNode.SetSliceProjectionUseFiducialColor(True)
         if hasattr(displayNode, "SetSliceProjectionOutlinedBehindSlicePlane"):
@@ -1333,26 +1618,88 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         if hasattr(displayNode, "SetSliceProjectionColor"):
             displayNode.SetSliceProjectionColor(color[0], color[1], color[2])
 
-    def _hideCurrentSegmentNameLabel(self):
-        """Hide the current segment label without deleting the markups node."""
-        labelNode = self.currentSegmentLabelNode
-        if not labelNode:
-            try:
-                labelNode = slicer.util.getNode(SEGMENT_NAME_LABEL_NODE_NAME)
-            except Exception:
+    def _setMarkupViewRestriction(self, displayNode, viewNodeID):
+        """Restrict a label to one slice view when the display node supports it."""
+        try:
+            if hasattr(displayNode, "RemoveAllViewNodeIDs"):
+                displayNode.RemoveAllViewNodeIDs()
+            if not viewNodeID:
                 return
-        self._configureCurrentSegmentNameLabelDisplay(labelNode, visible=False)
+            if hasattr(displayNode, "AddViewNodeID"):
+                displayNode.AddViewNodeID(viewNodeID)
+                return
+            if hasattr(displayNode, "SetViewNodeIDs"):
+                viewNodeIDs = vtk.vtkStringArray()
+                viewNodeIDs.InsertNextValue(viewNodeID)
+                displayNode.SetViewNodeIDs(viewNodeIDs)
+        except Exception:
+            logging.debug("Could not restrict segment label to a slice view", exc_info=True)
+
+    def _setSegmentNameLabelViewAttribute(self, labelNode, viewNodeID):
+        """Store which slice view owns a label so one view can refresh independently."""
+        if not labelNode or not hasattr(labelNode, "SetAttribute"):
+            return
+        labelNode.SetAttribute(
+            SEGMENT_NAME_LABEL_VIEW_NODE_ATTRIBUTE,
+            viewNodeID if viewNodeID else "",
+        )
+
+    def _hideCurrentSegmentNameLabel(self):
+        """Hide all segment name labels without deleting their markups nodes."""
+        self._hideSegmentNameLabelsForView(None)
+
+    def _hideSegmentNameLabelsForView(self, viewNodeID):
+        """Hide all labels, or only labels owned by one slice view."""
+        for labelNode in self._allSegmentNameLabelNodes():
+            if viewNodeID and not self._isSegmentNameLabelForView(labelNode, viewNodeID):
+                continue
+            self._configureCurrentSegmentNameLabelDisplay(labelNode, visible=False)
+
+    def _isSegmentNameLabelForView(self, labelNode, viewNodeID):
+        """Return True when a label node belongs to one slice view."""
+        if not labelNode or not viewNodeID:
+            return False
+        try:
+            return labelNode.GetAttribute(SEGMENT_NAME_LABEL_VIEW_NODE_ATTRIBUTE) == viewNodeID
+        except Exception:
+            return False
 
     def _removeCurrentSegmentNameLabel(self):
-        """Delete the current segment label node during module cleanup."""
-        labelNode = self.currentSegmentLabelNode
-        if not labelNode:
-            try:
-                labelNode = slicer.util.getNode(SEGMENT_NAME_LABEL_NODE_NAME)
-            except Exception:
-                return
-        slicer.mrmlScene.RemoveNode(labelNode)
+        """Delete all segment label nodes during module cleanup."""
+        for labelNode in self._allSegmentNameLabelNodes():
+            slicer.mrmlScene.RemoveNode(labelNode)
         self.currentSegmentLabelNode = None
+        self.segmentNameLabelNodesBySegmentID = {}
+
+    def _allSegmentNameLabelNodes(self):
+        """Return every markups node created for segment name labels."""
+        labelNodes = []
+        for labelNode in self.segmentNameLabelNodesBySegmentID.values():
+            if labelNode and labelNode not in labelNodes:
+                labelNodes.append(labelNode)
+
+        for labelNode in slicer.util.getNodesByClass("vtkMRMLMarkupsFiducialNode"):
+            nodeName = labelNode.GetName() if labelNode else ""
+            if (
+                nodeName == SEGMENT_NAME_LABEL_NODE_NAME
+                or nodeName.startswith(SEGMENT_NAME_LABEL_NODE_PREFIX)
+            ) and labelNode not in labelNodes:
+                labelNodes.append(labelNode)
+        return labelNodes
+
+    def currentSliceNodes(self):
+        """Return slice nodes currently shown in the layout."""
+        layoutManager = slicer.app.layoutManager()
+        sliceNodes = []
+        if layoutManager:
+            for sliceViewName in layoutManager.sliceViewNames():
+                sliceWidget = layoutManager.sliceWidget(sliceViewName)
+                sliceNode = sliceWidget.mrmlSliceNode() if sliceWidget else None
+                if sliceNode and sliceNode not in sliceNodes:
+                    sliceNodes.append(sliceNode)
+        if sliceNodes:
+            return sliceNodes
+        return slicer.util.getNodesByClass("vtkMRMLSliceNode")
 
     def segmentationNode(self):
         """Return the selected mucus segmentation node."""
@@ -1528,6 +1875,304 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
     def onObservedSegmentationDisplayChanged(self, caller=None, event=None):
         """Refresh visibility controls when the segmentation display node changes."""
         self.updateSegmentCountAndButtons()
+        if self.logic.isSegmentationVisible(self.segmentationNode()):
+            self.refreshVisibleSegmentNameLabels()
+        else:
+            self._hideCurrentSegmentNameLabel()
+
+    def _observeSliceNodes(self):
+        """Observe slice offset/orientation changes so visible labels follow scrolling."""
+        self._removeSliceNodeObservers()
+        for sliceNode in slicer.util.getNodesByClass("vtkMRMLSliceNode"):
+            for event in self._sliceNodeObserverEvents():
+                tag = sliceNode.AddObserver(event, self.onSliceNodeModified)
+                self._observedSliceNodes.append(sliceNode)
+                self._sliceNodeObserverTags.append(tag)
+
+    def _sliceNodeObserverEvents(self):
+        """Return slice-node event IDs that may change which pixels are displayed."""
+        events = [vtk.vtkCommand.ModifiedEvent]
+        sliceNodeClass = getattr(slicer, "vtkMRMLSliceNode", None)
+        for eventName in ("SliceToRASModifiedEvent", "FieldOfViewModifiedEvent"):
+            event = getattr(sliceNodeClass, eventName, None) if sliceNodeClass else None
+            if event is not None:
+                events.append(event)
+        return list(dict.fromkeys(events))
+
+    def _observeSliceViews(self):
+        """Install wheel-event filters on slice views so mouse scrolling refreshes labels."""
+        if not self._sliceViewEventFiltersSupported:
+            self.debugSegmentLabelMessage(
+                "slice wheel filter: skipped because this Slicer build rejected it"
+            )
+            return
+        self._removeSliceViewEventFilters()
+        layoutManager = slicer.app.layoutManager()
+        if not layoutManager:
+            self.debugSegmentLabelMessage("slice wheel filter: no layout manager")
+            return
+        installedCount = 0
+        for sliceViewName in layoutManager.sliceViewNames():
+            sliceWidget = layoutManager.sliceWidget(sliceViewName)
+            sliceView = sliceWidget.sliceView() if sliceWidget else None
+            if not sliceView:
+                continue
+            installedCount += self._installSliceViewEventFilter(sliceView)
+            for childWidget in sliceView.findChildren(qt.QWidget):
+                installedCount += self._installSliceViewEventFilter(childWidget)
+        self.debugSegmentLabelMessage(
+            "slice wheel filter: installed on {} widget(s)".format(installedCount)
+        )
+
+    def _installSliceViewEventFilter(self, widget):
+        """Install this widget as an event filter once."""
+        if not self._sliceViewEventFiltersSupported:
+            return 0
+        if not widget or widget in self._observedSliceViews:
+            return 0
+        try:
+            widget.installEventFilter(self)
+        except Exception as exc:
+            self._sliceViewEventFiltersSupported = False
+            self.debugSegmentLabelMessage(
+                "slice wheel filter: disabled after install failed: {}".format(exc)
+            )
+            return 0
+        self._observedSliceViews.append(widget)
+        return 1
+
+    def _removeSliceViewEventFilters(self):
+        """Remove wheel-event filters from previously observed slice views."""
+        for sliceView in self._observedSliceViews:
+            try:
+                sliceView.removeEventFilter(self)
+            except Exception:
+                logging.debug("Could not remove slice view event filter", exc_info=True)
+        self._observedSliceViews = []
+
+    def eventFilter(self, watched, event):
+        """Refresh labels after mouse-wheel scrolling changes a slice view."""
+        try:
+            if event.type() == qt.QEvent.Wheel and watched in self._observedSliceViews:
+                self.debugSegmentLabelMessage(
+                    "mouse wheel event caught on {}".format(
+                        self.widgetDebugName(watched)
+                    )
+                )
+                qt.QTimer.singleShot(0, self.onSliceViewWheelScrolled)
+        except Exception:
+            logging.debug("Could not handle slice view wheel event", exc_info=True)
+        return False
+
+    def onSliceViewWheelScrolled(self):
+        """Run the complete label check after one mouse-wheel scroll step."""
+        if not self._moduleIsActive or self._suppressSliceLabelRefresh:
+            self.debugSegmentLabelMessage(
+                "mouse wheel callback ignored: active={} suppressed={}".format(
+                    self._moduleIsActive,
+                    self._suppressSliceLabelRefresh,
+                )
+            )
+            return
+        self.debugSegmentLabelMessage("mouse wheel callback: running full check")
+        self.refreshVisibleSegmentNameLabelsAfterSliceChange()
+
+    def _startSliceChangePolling(self):
+        """Start polling slice state as a fallback for missed scroll events."""
+        if not self.sliceChangePollTimer:
+            return
+        if self.sliceChangePollTimer.isActive():
+            return
+        self._lastSliceStateSignature = self.currentSliceStateSignature()
+        self.sliceChangePollTimer.start()
+        self.debugSegmentLabelMessage(
+            "slice polling: started with interval {} ms; offsets={}".format(
+                SLICE_CHANGE_POLL_INTERVAL_MS,
+                self.currentSliceOffsetSummary(),
+            )
+        )
+
+    def ensureSliceChangeMonitoringActive(self):
+        """Start slice observers and polling when this module is visible after reload."""
+        if not self.sliceChangePollTimer:
+            return
+        if not self._moduleIsActive and self._isModuleActiveForShortcut():
+            self._moduleIsActive = True
+            self.debugSegmentLabelMessage(
+                "slice monitoring: activated outside enter()"
+            )
+        if not self._observedSliceNodes:
+            self._observeSliceNodes()
+        if self._sliceViewEventFiltersSupported and not self._observedSliceViews:
+            self._observeSliceViews()
+        if not self.sliceChangePollTimer.isActive():
+            self._startSliceChangePolling()
+
+    def _stopSliceChangePolling(self):
+        """Stop polling slice state."""
+        if self.sliceChangePollTimer:
+            self.sliceChangePollTimer.stop()
+        self._lastSliceStateSignature = None
+
+    def onSliceChangePollTimer(self):
+        """Detect silent slice changes and run the full label refresh."""
+        if self._suppressSliceLabelRefresh:
+            return
+        if self._sliceLabelRefreshInProgress:
+            return
+        currentSignature = self.currentSliceStateSignature()
+        if currentSignature == self._lastSliceStateSignature:
+            return
+        previousSignature = self._lastSliceStateSignature
+        previousOffsets = self.sliceOffsetSummaryFromSignature(
+            previousSignature
+        )
+        self._lastSliceStateSignature = currentSignature
+        changedSliceNodes = self.changedSliceNodesFromSignatures(
+            previousSignature,
+            currentSignature,
+        )
+        self.debugSegmentLabelMessage(
+            "slice polling: offset changed {} -> {}; changed views={}".format(
+                previousOffsets,
+                self.currentSliceOffsetSummary(),
+                self.sliceNodeNames(changedSliceNodes),
+            )
+        )
+        if len(changedSliceNodes) == 1:
+            self.refreshVisibleSegmentNameLabelsForSliceNode(
+                changedSliceNodes[0],
+                reason="slice polling single-view check",
+            )
+        else:
+            self.refreshVisibleSegmentNameLabelsForSliceNodes(
+                changedSliceNodes if changedSliceNodes else self.currentSliceNodes(),
+                reason="slice polling multi-view check",
+            )
+
+    def currentSliceStateSignature(self):
+        """Return a compact signature of current slice matrices and field-of-view."""
+        signature = []
+        for sliceNode in self.currentSliceNodes():
+            sliceToRAS = sliceNode.GetSliceToRAS() if sliceNode else None
+            matrixValues = []
+            if sliceToRAS:
+                matrixValues = [
+                    round(float(sliceToRAS.GetElement(row, column)), 3)
+                    for row in range(3)
+                    for column in range(4)
+                ]
+            try:
+                fieldOfView = [
+                    round(float(value), 3)
+                    for value in sliceNode.GetFieldOfView()
+                ]
+            except Exception:
+                fieldOfView = []
+            try:
+                sliceOffset = round(float(sliceNode.GetSliceOffset()), 3)
+            except Exception:
+                sliceOffset = None
+            signature.append(
+                (
+                    sliceNode.GetID() if sliceNode else "",
+                    sliceOffset,
+                    tuple(matrixValues),
+                    tuple(fieldOfView),
+                )
+            )
+        return tuple(signature)
+
+    def currentSliceOffsetSummary(self):
+        """Return current slice offsets for debug messages."""
+        return self.sliceOffsetSummaryFromSignature(self.currentSliceStateSignature())
+
+    def changedSliceNodesFromSignatures(self, previousSignature, currentSignature):
+        """Return slice nodes whose signature entry changed."""
+        if not previousSignature or not currentSignature:
+            return self.currentSliceNodes()
+        previousByID = {item[0]: item for item in previousSignature}
+        changedSliceNodes = []
+        for currentItem in currentSignature:
+            sliceNodeID = currentItem[0]
+            if previousByID.get(sliceNodeID) == currentItem:
+                continue
+            sliceNode = slicer.mrmlScene.GetNodeByID(sliceNodeID)
+            if sliceNode:
+                changedSliceNodes.append(sliceNode)
+        return changedSliceNodes
+
+    def sliceNodeNames(self, sliceNodes):
+        """Return a readable list of slice-node names for debug messages."""
+        if not sliceNodes:
+            return "none"
+        names = []
+        for sliceNode in sliceNodes:
+            if sliceNode and hasattr(sliceNode, "GetName"):
+                names.append(sliceNode.GetName())
+            elif sliceNode:
+                names.append(str(sliceNode))
+        return ", ".join(names)
+
+    def sliceOffsetSummaryFromSignature(self, signature):
+        """Return a readable slice-offset summary from a slice state signature."""
+        if not signature:
+            return "none"
+        return ", ".join(
+            "{}={}".format(item[0], item[1])
+            for item in signature
+        )
+
+    def widgetDebugName(self, widget):
+        """Return a compact widget name for console diagnostics."""
+        try:
+            className = widget.metaObject().className()
+        except Exception:
+            className = widget.__class__.__name__
+        try:
+            objectName = widget.objectName
+            if callable(objectName):
+                objectName = objectName()
+        except Exception:
+            objectName = ""
+        return "{}('{}')".format(className, objectName)
+
+    def _removeSliceNodeObservers(self):
+        """Remove VTK observers from slice nodes."""
+        for sliceNode, tag in zip(self._observedSliceNodes, self._sliceNodeObserverTags):
+            try:
+                sliceNode.RemoveObserver(tag)
+            except Exception:
+                logging.debug("Could not remove slice node observer", exc_info=True)
+        self._observedSliceNodes = []
+        self._sliceNodeObserverTags = []
+
+    def onSliceNodeModified(self, caller=None, event=None):
+        """Schedule a label refresh after the user scrolls or changes a slice view."""
+        if (
+            not self._moduleIsActive
+            or not self.labelUpdateTimer
+            or self._suppressSliceLabelRefresh
+        ):
+            self.debugSegmentLabelMessage(
+                "slice node event ignored: active={} timer={} suppressed={}".format(
+                    self._moduleIsActive,
+                    bool(self.labelUpdateTimer),
+                    self._suppressSliceLabelRefresh,
+                )
+            )
+            return
+        callerName = caller.GetName() if caller and hasattr(caller, "GetName") else ""
+        self.debugSegmentLabelMessage(
+            "slice node event caught: caller={} event={}".format(callerName, event)
+        )
+        if caller and hasattr(caller, "GetSliceToRAS"):
+            self.refreshVisibleSegmentNameLabelsForSliceNode(
+                caller,
+                reason="slice node single-view check",
+            )
+        else:
+            self.refreshVisibleSegmentNameLabelsAfterSliceChange()
 
 
 #
@@ -1537,6 +2182,14 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
 class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
     """Keep non-UI calculations and MRML operations separate from the widget."""
+
+    def __init__(self):
+        """Create logic state used by measurement, navigation, and label helpers."""
+        ScriptedLoadableModuleLogic.__init__(self)
+        self._segmentLabelPointCache = {}
+        self._segmentLabelCacheBuildPending = False
+        self._lastSegmentLabelCacheWasBuilt = False
+        self._lastSegmentLabelDebugSummary = ""
 
     def runDummyMucusModelTest(self, pythonExecutable=None, caseID="dummy_case"):
         """Run the bundled dummy mucus model script as an external process."""
@@ -2247,13 +2900,42 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
                 referenceVolumeNode,
             )
 
-    def _occupiedVoxelCoordinates(self, segmentationNode, segmentID, referenceVolumeNode, np):
-        """Convert a segment labelmap into nonzero voxel coordinates."""
-        segmentArray = self._segmentArray(
+    def _segmentArrayInReferenceGeometry(
+        self,
+        segmentationNode,
+        segmentID,
+        referenceVolumeNode,
+    ):
+        """Return a segment labelmap resampled into the source-volume geometry."""
+        if not referenceVolumeNode:
+            return self._segmentArray(segmentationNode, segmentID, referenceVolumeNode)
+        return slicer.util.arrayFromSegmentBinaryLabelmap(
             segmentationNode,
             segmentID,
             referenceVolumeNode,
         )
+
+    def _occupiedVoxelCoordinates(
+        self,
+        segmentationNode,
+        segmentID,
+        referenceVolumeNode,
+        np,
+        forceReferenceGeometry=False,
+    ):
+        """Convert a segment labelmap into nonzero voxel coordinates."""
+        if forceReferenceGeometry:
+            segmentArray = self._segmentArrayInReferenceGeometry(
+                segmentationNode,
+                segmentID,
+                referenceVolumeNode,
+            )
+        else:
+            segmentArray = self._segmentArray(
+                segmentationNode,
+                segmentID,
+                referenceVolumeNode,
+            )
         return np.argwhere(segmentArray != 0)
 
     def _principalAxisLengthPixels(self, occupiedVoxelCoordinates, np):
@@ -2333,7 +3015,7 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
             )
             return False
 
-        self.resetSliceFieldOfViewBaseline(baseFieldOfViewBySliceNodeID)
+        self.ensureSliceFieldOfViewBaseline(baseFieldOfViewBySliceNodeID)
         for sliceNode in slicer.util.getNodesByClass("vtkMRMLSliceNode"):
             sliceNode.JumpSliceByCentering(centerRAS[0], centerRAS[1], centerRAS[2])
 
@@ -2352,6 +3034,544 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
         if centerRAS is None or len(centerRAS) < 3:
             return None
         return [float(centerRAS[0]), float(centerRAS[1]), float(centerRAS[2])]
+
+    def visibleSegmentLabelEntries(
+        self,
+        segmentationNode,
+        sliceNodes,
+        referenceVolumeNode=None,
+        allowCacheBuild=True,
+        cacheBuildLimit=SEGMENT_NAME_LABEL_CACHE_BUILD_LIMIT,
+    ):
+        """Return label data for active segments intersecting current slice views."""
+        labelEntries = []
+        if not segmentationNode or not sliceNodes:
+            self._lastSegmentLabelDebugSummary = "no segmentation or slice nodes"
+            return labelEntries
+        self._segmentLabelCacheBuildPending = False
+        uncachedBuildsRemaining = (
+            float("inf") if cacheBuildLimit is None else cacheBuildLimit
+        )
+        debugCounts = {
+            "active": 0,
+            "visible": 0,
+            "bounds": 0,
+            "checked": 0,
+            "cacheBuilt": 0,
+            "cachePending": 0,
+            "labels": 0,
+            "noPixel": 0,
+        }
+
+        for segmentID in self.activeSegmentIDs(segmentationNode):
+            debugCounts["active"] += 1
+            if not self.isSegmentVisible(segmentationNode, segmentID):
+                continue
+            debugCounts["visible"] += 1
+            if not self.segmentBoundsIntersectAnySliceView(
+                segmentationNode,
+                segmentID,
+                sliceNodes,
+            ):
+                continue
+            debugCounts["bounds"] += 1
+            labelPositionsRAS = self.segmentLabelPositionsFromPixelsOnSlicesRAS(
+                segmentationNode,
+                segmentID,
+                sliceNodes,
+                referenceVolumeNode,
+                allowCacheBuild=(
+                    allowCacheBuild and uncachedBuildsRemaining > 0
+                ),
+            )
+            debugCounts["checked"] += 1
+            if self._lastSegmentLabelCacheWasBuilt:
+                uncachedBuildsRemaining -= 1
+                debugCounts["cacheBuilt"] += 1
+            if self._segmentLabelCacheBuildPending:
+                debugCounts["cachePending"] += 1
+            if not labelPositionsRAS and not referenceVolumeNode:
+                labelPositionsRAS = self.segmentLabelPositionsOnSlicesRAS(
+                    segmentationNode,
+                    segmentID,
+                    sliceNodes,
+                )
+            if not labelPositionsRAS:
+                debugCounts["noPixel"] += 1
+                continue
+            segmentName = self.segmentName(segmentationNode, segmentID)
+            segmentColor = self.segmentDisplayColor(segmentationNode, segmentID)
+            for positionIndex, labelPosition in enumerate(labelPositionsRAS):
+                viewNodeID = labelPosition.get("viewNodeID", "")
+                labelEntries.append(
+                    {
+                        "labelID": "{}_{}".format(
+                            segmentID,
+                            viewNodeID if viewNodeID else "slice{}".format(positionIndex),
+                        ),
+                        "segmentID": segmentID,
+                        "segmentName": segmentName,
+                        "color": segmentColor,
+                        "positionRAS": labelPosition["positionRAS"],
+                        "viewNodeID": viewNodeID,
+                    }
+                )
+                debugCounts["labels"] += 1
+        self._lastSegmentLabelDebugSummary = ", ".join(
+            "{}={}".format(key, value) for key, value in debugCounts.items()
+        )
+        return labelEntries
+
+    def segmentLabelCacheBuildPending(self):
+        """Return True when another label refresh should continue cache building."""
+        return self._segmentLabelCacheBuildPending
+
+    def lastSegmentLabelDebugSummary(self):
+        """Return the latest label-check debug counter summary."""
+        return self._lastSegmentLabelDebugSummary
+
+    def segmentLabelPositionsFromPixelsOnSlicesRAS(
+        self,
+        segmentationNode,
+        segmentID,
+        sliceNodes,
+        referenceVolumeNode,
+        allowCacheBuild=True,
+    ):
+        """Return label positions for slice views that show at least one segment pixel."""
+        if not referenceVolumeNode:
+            return []
+        try:
+            import numpy as np
+
+            pointData = self.cachedSegmentLabelPointsRAS(
+                segmentationNode,
+                segmentID,
+                np,
+                allowCacheBuild=allowCacheBuild,
+            )
+        except Exception:
+            logging.debug(
+                "Could not get segment pixels for visible label check",
+                exc_info=True,
+            )
+            return []
+
+        if pointData is None:
+            return []
+
+        labelPositionsRAS = []
+        for sliceNode in sliceNodes:
+            plane = self.slicePlaneRAS(sliceNode)
+            if plane is None:
+                continue
+            labelPositionRAS = self.labelPositionForSlicePixelsRAS(
+                pointData,
+                plane,
+                np,
+            )
+            if labelPositionRAS is not None:
+                labelPositionsRAS.append(
+                    {
+                        "positionRAS": labelPositionRAS,
+                        "viewNodeID": sliceNode.GetID() if sliceNode else "",
+                    }
+                )
+        return labelPositionsRAS
+
+    def cachedSegmentLabelPointsRAS(
+        self,
+        segmentationNode,
+        segmentID,
+        np,
+        allowCacheBuild=True,
+    ):
+        """Return cached RAS point data for one segment's nonzero labelmap pixels."""
+        self._lastSegmentLabelCacheWasBuilt = False
+        cacheKey = self.segmentLabelPointCacheKey(segmentationNode, segmentID)
+        segmentMTime = self.segmentMTime(segmentationNode, segmentID)
+        cachedEntry = self._segmentLabelPointCache.get(cacheKey)
+        if cachedEntry and cachedEntry.get("segmentMTime") == segmentMTime:
+            return cachedEntry.get("pointData")
+
+        if not allowCacheBuild:
+            self._segmentLabelCacheBuildPending = True
+            return None
+
+        pointData = self.segmentLabelPointsRAS(segmentationNode, segmentID, np)
+        self._lastSegmentLabelCacheWasBuilt = True
+        self._segmentLabelPointCache[cacheKey] = {
+            "segmentMTime": segmentMTime,
+            "pointData": pointData,
+        }
+        return pointData
+
+    def segmentLabelPointCacheKey(self, segmentationNode, segmentID):
+        """Return the cache key used for one segment's label points."""
+        nodeID = segmentationNode.GetID() if segmentationNode else ""
+        return "{}|{}".format(nodeID, segmentID)
+
+    def segmentMTime(self, segmentationNode, segmentID):
+        """Return a segment modification time for cache invalidation."""
+        segment = self.segment(segmentationNode, segmentID)
+        if segment and hasattr(segment, "GetMTime"):
+            try:
+                return segment.GetMTime()
+            except Exception:
+                logging.debug("Could not read segment MTime", exc_info=True)
+        return 0
+
+    def segmentLabelPointsRAS(self, segmentationNode, segmentID, np):
+        """Build RAS point data for one segment's nonzero labelmap pixels."""
+        imageData = self.segmentBinaryLabelmapRepresentation(
+            segmentationNode,
+            segmentID,
+        )
+        occupiedVoxelCoordinates = self.occupiedImageVoxelCoordinates(
+            imageData,
+            np,
+        )
+        if occupiedVoxelCoordinates.size == 0:
+            return None
+        if occupiedVoxelCoordinates.shape[0] >= EXPORT_MASK_MIN_VOLUME_PIXELS:
+            return None
+        return self.imageVoxelPointDataRAS(
+            occupiedVoxelCoordinates,
+            imageData,
+            np,
+        )
+
+    def segmentBinaryLabelmapRepresentation(self, segmentationNode, segmentID):
+        """Return a cropped binary labelmap image for one segment."""
+        imageData = self.createOrientedImageData()
+        if not imageData:
+            return None
+        success = segmentationNode.GetBinaryLabelmapRepresentation(
+            segmentID,
+            imageData,
+        )
+        if success is False:
+            return None
+        return imageData
+
+    def createOrientedImageData(self):
+        """Create vtkOrientedImageData across Slicer Python wrapping variants."""
+        if hasattr(slicer, "vtkOrientedImageData"):
+            return slicer.vtkOrientedImageData()
+        try:
+            import vtkSegmentationCorePython as vtkSegmentationCore
+
+            return vtkSegmentationCore.vtkOrientedImageData()
+        except Exception:
+            logging.debug("Could not create vtkOrientedImageData", exc_info=True)
+            return None
+
+    def occupiedImageVoxelCoordinates(self, imageData, np):
+        """Return nonzero voxel coordinates from a cropped segment image."""
+        if not imageData:
+            return np.empty((0, 3), dtype=int)
+        scalars = imageData.GetPointData().GetScalars()
+        if not scalars:
+            return np.empty((0, 3), dtype=int)
+
+        from vtk.util import numpy_support
+
+        dimensions = imageData.GetDimensions()
+        if not dimensions or min(dimensions) <= 0:
+            return np.empty((0, 3), dtype=int)
+        segmentArray = numpy_support.vtk_to_numpy(scalars).reshape(
+            dimensions[2],
+            dimensions[1],
+            dimensions[0],
+        )
+        return np.argwhere(segmentArray != 0)
+
+    def imageVoxelPointDataRAS(self, occupiedVoxelCoordinates, imageData, np):
+        """Convert cropped KJI image coordinates into RAS points and voxel axes."""
+        if not imageData or occupiedVoxelCoordinates.size == 0:
+            return None
+
+        ijkCoordinates = occupiedVoxelCoordinates[:, [2, 1, 0]].astype(float)
+        extent = imageData.GetExtent()
+        ijkCoordinates[:, 0] += float(extent[0])
+        ijkCoordinates[:, 1] += float(extent[2])
+        ijkCoordinates[:, 2] += float(extent[4])
+
+        homogeneousCoordinates = np.ones(
+            (ijkCoordinates.shape[0], 4),
+            dtype=float,
+        )
+        homogeneousCoordinates[:, 0:3] = ijkCoordinates
+
+        imageToRAS = vtk.vtkMatrix4x4()
+        imageData.GetImageToWorldMatrix(imageToRAS)
+        transform = np.array(
+            [
+                [imageToRAS.GetElement(row, column) for column in range(4)]
+                for row in range(4)
+            ],
+            dtype=float,
+        )
+        return {
+            "pointsRAS": homogeneousCoordinates.dot(transform.T)[:, 0:3],
+            "axisVectorsRAS": [
+                transform[0:3, 0],
+                transform[0:3, 1],
+                transform[0:3, 2],
+            ],
+        }
+
+    def segmentBoundsIntersectAnySliceView(self, segmentationNode, segmentID, sliceNodes):
+        """Return True when segment bounds overlap any currently displayed slice view."""
+        boundsRAS = self.segmentBoundsRAS(segmentationNode, segmentID)
+        if boundsRAS is None:
+            return True
+        boundsCornersRAS = self.boundsCornersRAS(boundsRAS)
+        for sliceNode in sliceNodes:
+            plane = self.slicePlaneRAS(sliceNode)
+            if plane is None:
+                continue
+            projectedBounds = self.projectBoundsToSlice(boundsCornersRAS, plane)
+            if self.projectedBoundsIntersectSliceView(projectedBounds, plane):
+                return True
+        return False
+
+    def labelPositionForSlicePixelsRAS(self, pointData, plane, np):
+        """Return a label point when at least one segment pixel is visible."""
+        pointsRAS = pointData.get("pointsRAS") if pointData else None
+        if pointsRAS is None:
+            return None
+        origin = np.asarray(plane["origin"], dtype=float)
+        xAxis = np.asarray(plane["xAxis"], dtype=float)
+        yAxis = np.asarray(plane["yAxis"], dtype=float)
+        normal = np.asarray(plane["normal"], dtype=float)
+        axisVectorsRAS = pointData.get("axisVectorsRAS")
+        sliceToleranceMM = self.sliceVoxelIntersectionToleranceMM(
+            axisVectorsRAS, normal, np
+        )
+        xToleranceMM = self.sliceVoxelIntersectionToleranceMM(
+            axisVectorsRAS, xAxis, np
+        )
+        yToleranceMM = self.sliceVoxelIntersectionToleranceMM(
+            axisVectorsRAS, yAxis, np
+        )
+
+        pointsFromOrigin = pointsRAS - origin
+        projectedX = pointsFromOrigin.dot(xAxis)
+        projectedY = pointsFromOrigin.dot(yAxis)
+        distanceFromSlice = pointsFromOrigin.dot(normal)
+
+        visiblePixelMask = (
+            (np.abs(distanceFromSlice) <= sliceToleranceMM)
+            & (projectedX >= -plane["halfWidth"] - xToleranceMM)
+            & (projectedX <= plane["halfWidth"] + xToleranceMM)
+            & (projectedY >= -plane["halfHeight"] - yToleranceMM)
+            & (projectedY <= plane["halfHeight"] + yToleranceMM)
+        )
+        if not np.any(visiblePixelMask):
+            return None
+
+        visibleX = projectedX[visiblePixelMask]
+        visibleY = projectedY[visiblePixelMask]
+        projectedBounds = {
+            "minX": float(visibleX.min()),
+            "maxX": float(visibleX.max()),
+            "minY": float(visibleY.min()),
+            "maxY": float(visibleY.max()),
+        }
+        margin = self.slicePixelLabelMargin(projectedBounds)
+        labelX = self.labelXPositionInsideSliceView(projectedBounds, plane, margin)
+        labelY = self.clamp(
+            (projectedBounds["minY"] + projectedBounds["maxY"]) * 0.5,
+            -plane["halfHeight"] + margin,
+            plane["halfHeight"] - margin,
+        )
+        labelPoint = origin + xAxis * labelX + yAxis * labelY
+        return [float(labelPoint[0]), float(labelPoint[1]), float(labelPoint[2])]
+
+    def sliceVoxelIntersectionToleranceMM(self, axisVectorsRAS, normal, np):
+        """Return the half-voxel distance where one pixel still intersects."""
+        if not axisVectorsRAS:
+            return SEGMENT_NAME_LABEL_SLICE_TOLERANCE_MM
+        toleranceMM = 0.0
+        for axisVector in axisVectorsRAS:
+            toleranceMM += abs(float(np.dot(axisVector, normal))) * 0.5
+        return max(toleranceMM + 0.01, 0.01)
+
+    def slicePixelLabelMargin(self, projectedBounds):
+        """Return a small label offset based on visible segment size in the slice."""
+        visibleWidth = max(projectedBounds["maxX"] - projectedBounds["minX"], 0.0)
+        visibleHeight = max(projectedBounds["maxY"] - projectedBounds["minY"], 0.0)
+        return max(
+            max(visibleWidth, visibleHeight) * SEGMENT_NAME_LABEL_OFFSET_FRACTION,
+            SEGMENT_NAME_LABEL_OFFSET_MINIMUM_MM,
+        )
+
+    def isSegmentVisible(self, segmentationNode, segmentID):
+        """Return True if one segment is visible in the segmentation display node."""
+        if not self.isValidSegmentID(segmentationNode, segmentID):
+            return False
+        segmentationNode.CreateDefaultDisplayNodes()
+        displayNode = segmentationNode.GetDisplayNode()
+        if not displayNode:
+            return True
+        try:
+            return bool(displayNode.GetSegmentVisibility(segmentID))
+        except Exception:
+            return True
+
+    def segmentLabelPositionOnAnySliceRAS(self, segmentationNode, segmentID, sliceNodes):
+        """Return the first label position for a segment intersecting any current slice."""
+        labelPositionsRAS = self.segmentLabelPositionsOnSlicesRAS(
+            segmentationNode,
+            segmentID,
+            sliceNodes,
+        )
+        return labelPositionsRAS[0]["positionRAS"] if labelPositionsRAS else None
+
+    def segmentLabelPositionsOnSlicesRAS(self, segmentationNode, segmentID, sliceNodes):
+        """Return label positions for all slice views overlapped by segment bounds."""
+        labelPositionsRAS = []
+        for sliceNode in sliceNodes:
+            labelPositionRAS = self.segmentLabelPositionOnSliceRAS(
+                segmentationNode,
+                segmentID,
+                sliceNode,
+            )
+            if labelPositionRAS is not None:
+                labelPositionsRAS.append(
+                    {
+                        "positionRAS": labelPositionRAS,
+                        "viewNodeID": sliceNode.GetID() if sliceNode else "",
+                    }
+                )
+        return labelPositionsRAS
+
+    def segmentLabelPositionOnSliceRAS(self, segmentationNode, segmentID, sliceNode):
+        """Return a label point when segment bounds overlap one visible slice view."""
+        boundsRAS = self.segmentBoundsRAS(segmentationNode, segmentID)
+        if boundsRAS is None:
+            return None
+        plane = self.slicePlaneRAS(sliceNode)
+        if plane is None:
+            return None
+
+        boundsCornersRAS = self.boundsCornersRAS(boundsRAS)
+        projectedBounds = self.projectBoundsToSlice(boundsCornersRAS, plane)
+        if not self.projectedBoundsIntersectSliceView(projectedBounds, plane):
+            return None
+
+        centerRAS = self.segmentCenterRAS(segmentationNode, segmentID)
+        if centerRAS is None:
+            centerRAS = self.boundsCenterRAS(boundsRAS)
+        centerSlice = self.projectPointToSlice(centerRAS, plane)
+        margin = self.segmentLabelMarginRAS(boundsRAS)
+        labelX = self.labelXPositionInsideSliceView(projectedBounds, plane, margin)
+        labelY = self.clamp(
+            centerSlice["y"],
+            -plane["halfHeight"] + margin,
+            plane["halfHeight"] - margin,
+        )
+        return self.add(
+            plane["origin"],
+            self.add(
+                self.scale(plane["xAxis"], labelX),
+                self.scale(plane["yAxis"], labelY),
+            ),
+        )
+
+    def slicePlaneRAS(self, sliceNode):
+        """Return slice plane origin, axes, and field-of-view in RAS coordinates."""
+        if not sliceNode:
+            return None
+        try:
+            sliceToRAS = sliceNode.GetSliceToRAS()
+        except Exception:
+            return None
+        if not sliceToRAS:
+            return None
+        origin = [float(sliceToRAS.GetElement(row, 3)) for row in range(3)]
+        xAxis = self.normalized(
+            [float(sliceToRAS.GetElement(row, 0)) for row in range(3)]
+        )
+        yAxis = self.normalized(
+            [float(sliceToRAS.GetElement(row, 1)) for row in range(3)]
+        )
+        normal = self.normalized(
+            [float(sliceToRAS.GetElement(row, 2)) for row in range(3)]
+        )
+        if not xAxis or not yAxis or not normal:
+            return None
+        try:
+            fieldOfView = sliceNode.GetFieldOfView()
+            halfWidth = max(float(fieldOfView[0]) * 0.5, 0.0)
+            halfHeight = max(float(fieldOfView[1]) * 0.5, 0.0)
+        except Exception:
+            halfWidth = float("inf")
+            halfHeight = float("inf")
+        return {
+            "origin": origin,
+            "xAxis": xAxis,
+            "yAxis": yAxis,
+            "normal": normal,
+            "halfWidth": halfWidth,
+            "halfHeight": halfHeight,
+        }
+
+    def projectBoundsToSlice(self, boundsCornersRAS, plane):
+        """Project RAS bounds corners into one slice coordinate system."""
+        projectedPoints = [
+            self.projectPointToSlice(cornerRAS, plane)
+            for cornerRAS in boundsCornersRAS
+        ]
+        return {
+            "minX": min(point["x"] for point in projectedPoints),
+            "maxX": max(point["x"] for point in projectedPoints),
+            "minY": min(point["y"] for point in projectedPoints),
+            "maxY": max(point["y"] for point in projectedPoints),
+            "minDistance": min(point["distance"] for point in projectedPoints),
+            "maxDistance": max(point["distance"] for point in projectedPoints),
+        }
+
+    def projectPointToSlice(self, pointRAS, plane):
+        """Project one RAS point into slice x/y/distance coordinates."""
+        pointFromOrigin = self.subtract(pointRAS, plane["origin"])
+        return {
+            "x": self.dot(pointFromOrigin, plane["xAxis"]),
+            "y": self.dot(pointFromOrigin, plane["yAxis"]),
+            "distance": self.dot(pointFromOrigin, plane["normal"]),
+        }
+
+    def projectedBoundsIntersectSliceView(self, projectedBounds, plane):
+        """Return True when projected segment bounds overlap the visible slice area."""
+        if (
+            projectedBounds["minDistance"] > SEGMENT_NAME_LABEL_SLICE_TOLERANCE_MM
+            or projectedBounds["maxDistance"] < -SEGMENT_NAME_LABEL_SLICE_TOLERANCE_MM
+        ):
+            return False
+        if projectedBounds["maxX"] < -plane["halfWidth"]:
+            return False
+        if projectedBounds["minX"] > plane["halfWidth"]:
+            return False
+        if projectedBounds["maxY"] < -plane["halfHeight"]:
+            return False
+        if projectedBounds["minY"] > plane["halfHeight"]:
+            return False
+        return True
+
+    def labelXPositionInsideSliceView(self, projectedBounds, plane, margin):
+        """Place the label beside a segment while keeping it inside the slice view."""
+        rightSideX = projectedBounds["maxX"] + margin
+        leftSideX = projectedBounds["minX"] - margin
+        if rightSideX <= plane["halfWidth"] - margin:
+            return rightSideX
+        if leftSideX >= -plane["halfWidth"] + margin:
+            return leftSideX
+        return self.clamp(
+            projectedBounds["maxX"],
+            -plane["halfWidth"] + margin,
+            plane["halfWidth"] - margin,
+        )
 
     def segmentLabelPositionRAS(self, segmentationNode, segmentID):
         """Return an RAS label point near, but outside, the segment bounds."""
@@ -2398,12 +3618,71 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
             return None
         return [float(value) for value in boundsRAS]
 
+    def boundsCornersRAS(self, boundsRAS):
+        """Return the eight RAS corners for a bounds tuple."""
+        return [
+            [x, y, z]
+            for x in (boundsRAS[0], boundsRAS[1])
+            for y in (boundsRAS[2], boundsRAS[3])
+            for z in (boundsRAS[4], boundsRAS[5])
+        ]
+
+    def boundsCenterRAS(self, boundsRAS):
+        """Return the center point of an RAS bounds tuple."""
+        return [
+            (boundsRAS[0] + boundsRAS[1]) * 0.5,
+            (boundsRAS[2] + boundsRAS[3]) * 0.5,
+            (boundsRAS[4] + boundsRAS[5]) * 0.5,
+        ]
+
+    def segmentLabelMarginRAS(self, boundsRAS):
+        """Return a margin for putting labels outside segment bounds."""
+        dimensions = [
+            max(boundsRAS[1] - boundsRAS[0], 0.0),
+            max(boundsRAS[3] - boundsRAS[2], 0.0),
+            max(boundsRAS[5] - boundsRAS[4], 0.0),
+        ]
+        return max(
+            max(dimensions) * SEGMENT_NAME_LABEL_OFFSET_FRACTION,
+            SEGMENT_NAME_LABEL_OFFSET_MINIMUM_MM,
+        )
+
+    def add(self, firstVector, secondVector):
+        """Add two 3D vectors."""
+        return [firstVector[index] + secondVector[index] for index in range(3)]
+
+    def subtract(self, firstVector, secondVector):
+        """Subtract two 3D vectors."""
+        return [firstVector[index] - secondVector[index] for index in range(3)]
+
+    def scale(self, vector, scaleFactor):
+        """Scale a 3D vector."""
+        return [vector[index] * scaleFactor for index in range(3)]
+
+    def dot(self, firstVector, secondVector):
+        """Return the dot product of two 3D vectors."""
+        return sum(firstVector[index] * secondVector[index] for index in range(3))
+
+    def normalized(self, vector):
+        """Return a normalized 3D vector, or None for a zero-length vector."""
+        length = sum(component * component for component in vector) ** 0.5
+        if length == 0:
+            return None
+        return [component / length for component in vector]
+
+    def clamp(self, value, minimumValue, maximumValue):
+        """Clamp a numeric value between a minimum and maximum."""
+        if minimumValue > maximumValue:
+            return value
+        return max(minimumValue, min(value, maximumValue))
+
     def applySliceZoom(self, zoomFactor, baseFieldOfViewBySliceNodeID):
         """Apply the zoom factor by reducing each slice view field-of-view."""
         zoomFactor = max(1.0, float(zoomFactor))
         for sliceNode in slicer.util.getNodesByClass("vtkMRMLSliceNode"):
             sliceNodeID = sliceNode.GetID()
-            baseFieldOfViewBySliceNodeID[sliceNodeID] = list(sliceNode.GetFieldOfView())
+            if sliceNodeID not in baseFieldOfViewBySliceNodeID:
+                baseFieldOfViewBySliceNodeID[sliceNodeID] = list(sliceNode.GetFieldOfView())
 
             baseFieldOfView = baseFieldOfViewBySliceNodeID[sliceNodeID]
             newFieldOfView = [
@@ -2413,6 +3692,16 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
             ]
             sliceNode.SetFieldOfView(newFieldOfView[0], newFieldOfView[1], newFieldOfView[2])
             sliceNode.UpdateMatrices()
+
+    def ensureSliceFieldOfViewBaseline(self, baseFieldOfViewBySliceNodeID):
+        """Create a fitted slice field-of-view baseline only when it is missing."""
+        sliceNodes = slicer.util.getNodesByClass("vtkMRMLSliceNode")
+        if (
+            baseFieldOfViewBySliceNodeID
+            and all(sliceNode.GetID() in baseFieldOfViewBySliceNodeID for sliceNode in sliceNodes)
+        ):
+            return
+        self.resetSliceFieldOfViewBaseline(baseFieldOfViewBySliceNodeID)
 
     def resetSliceFieldOfViewBaseline(self, baseFieldOfViewBySliceNodeID):
         """Reset slice views to a fitted baseline before applying jump zoom."""

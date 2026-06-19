@@ -128,6 +128,8 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self._segmentEditorShow3DButton = None
         self._suppressAutoJump = False
         self._suppressSliceLabelRefresh = False
+        self._suppressSegmentationChangeRefresh = False
+        self._suppressSegmentationDisplayRefresh = False
         self._sliceLabelRefreshInProgress = False
 
         self._initializeWidgetReferences()
@@ -865,10 +867,23 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             not self._suppressAutoJump
             and self.logic.isActiveSegmentID(self.segmentationNode(), segmentID)
         ):
-            self.jumpToSegment(segmentID)
+            self.debugSegmentLabelMessage(
+                "Segment list click: selected={}".format(
+                    self.logic.segmentName(self.segmentationNode(), segmentID)
+                )
+            )
+            self.jumpToSegment(
+                segmentID,
+                labelRefreshReason="Segment list click all-view check",
+            )
 
     def onObservedSegmentationChanged(self, caller=None, event=None):
         """Refresh the UI when segments are added, removed, reordered, or modified."""
+        if self._suppressSegmentationChangeRefresh:
+            self.debugSegmentLabelMessage(
+                "segmentation change ignored during status-only update"
+            )
+            return
         self._selectFirstSegmentIfNeeded()
         if not self.logic.isActiveSegmentID(self.segmentationNode(), self.currentSegmentID()):
             self._hideCurrentSegmentNameLabel()
@@ -906,7 +921,12 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         if not self.logic.isActiveSegmentID(self.segmentationNode(), segmentID):
             self._selectFirstSegmentIfNeeded()
             segmentID = self.currentSegmentID()
-        self.jumpToSegment(segmentID)
+        self.debugSegmentLabelMessage(
+            "Jump button: target={}".format(
+                self.logic.segmentName(self.segmentationNode(), segmentID)
+            )
+        )
+        self.jumpToSegment(segmentID, labelRefreshReason="Jump button all-view check")
 
     def onLastButton(self, checked=False):
         """Select the previous segment in segmentation order and jump to it."""
@@ -921,8 +941,17 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         )
         if not previousSegmentID:
             return
+        self.debugSegmentLabelMessage(
+            "Last button: current={} target={}".format(
+                self.logic.segmentName(segmentationNode, currentSegmentID),
+                self.logic.segmentName(segmentationNode, previousSegmentID),
+            )
+        )
         self._setCurrentSegmentIDWithoutAutoJump(previousSegmentID)
-        self.jumpToSegment(previousSegmentID)
+        self.jumpToSegment(
+            previousSegmentID,
+            labelRefreshReason="Last button all-view check",
+        )
         self.updateSegmentCountAndButtons()
 
     def onNextButton(self, checked=False):
@@ -938,9 +967,22 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         )
         if not nextSegmentID:
             return
-        self.logic.markSegmentDone(segmentationNode, currentSegmentID)
+        self.debugSegmentLabelMessage(
+            "Next button: current={} target={} markDone=True".format(
+                self.logic.segmentName(segmentationNode, currentSegmentID),
+                self.logic.segmentName(segmentationNode, nextSegmentID),
+            )
+        )
+        self._suppressSegmentationChangeRefresh = True
+        try:
+            self.logic.markSegmentDone(segmentationNode, currentSegmentID)
+        finally:
+            self._suppressSegmentationChangeRefresh = False
         self._setCurrentSegmentIDWithoutAutoJump(nextSegmentID)
-        self.jumpToSegment(nextSegmentID)
+        self.jumpToSegment(
+            nextSegmentID,
+            labelRefreshReason="Next button all-view check",
+        )
         self.updateSegmentCountAndButtons()
 
     def onLastShortcut(self):
@@ -1014,13 +1056,54 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         segmentationNode = self.segmentationNode()
         if not segmentationNode:
             return None
-        visible = not self.logic.isSegmentationVisible(segmentationNode)
-        self.logic.setSegmentationVisible(segmentationNode, visible)
+        startTime = time.time()
+        wasVisible = self.logic.isSegmentationVisible(segmentationNode)
+        visible = not wasVisible
+        self.debugSegmentLabelMessage(
+            "Hide/Show Seg button: start current={} target={}".format(
+                "visible" if wasVisible else "hidden",
+                "visible" if visible else "hidden",
+            )
+        )
+        visibilityStartTime = time.time()
+        self._suppressSegmentationDisplayRefresh = True
+        try:
+            self.logic.setSegmentationVisible(segmentationNode, visible)
+            visible = self.logic.isSegmentationVisible(segmentationNode)
+        finally:
+            self._suppressSegmentationDisplayRefresh = False
+        self.debugSegmentLabelMessage(
+            "Hide/Show Seg button: Slicer visibility toggle took {:.3f}s".format(
+                time.time() - visibilityStartTime
+            )
+        )
+        self.debugSegmentLabelMessage(
+            "Hide/Show Seg button: segmentation is now {}".format(
+                "visible" if visible else "hidden"
+            )
+        )
         if visible:
-            self.refreshVisibleSegmentNameLabels()
+            labelStartTime = time.time()
+            self.refreshVisibleSegmentNameLabels(reason="Hide/Show Seg button refresh")
+            self.debugSegmentLabelMessage(
+                "Hide/Show Seg button: label refresh took {:.3f}s".format(
+                    time.time() - labelStartTime
+                )
+            )
         else:
+            labelStartTime = time.time()
             self._hideCurrentSegmentNameLabel()
+            self.debugSegmentLabelMessage(
+                "Hide/Show Seg button: hiding labels took {:.3f}s".format(
+                    time.time() - labelStartTime
+                )
+            )
         self.updateSegmentCountAndButtons()
+        self.debugSegmentLabelMessage(
+            "Hide/Show Seg button: total took {:.3f}s".format(
+                time.time() - startTime
+            )
+        )
         return visible
 
     def onSegmentationVisibilityShortcut(self):
@@ -1029,6 +1112,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         if blockingReason:
             self._showShortcutMessage(blockingReason)
             return
+        self.debugSegmentLabelMessage("H shortcut: pressed")
         visible = self.onSegmentationVisibilityButton()
         self._showShortcutMessage("Mucus segmentation is now {}.".format("visible" if visible else "hidden"))
 
@@ -1067,7 +1151,16 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self._setCurrentSegmentIDWithoutAutoJump(nextSegmentID if nextSegmentID else "")
         self.updateSegmentCountAndButtons()
         if nextSegmentID:
-            self.jumpToSegment(nextSegmentID)
+            self.debugSegmentLabelMessage(
+                "Delete button: removed={} target={}".format(
+                    segmentName,
+                    self.logic.segmentName(segmentationNode, nextSegmentID),
+                )
+            )
+            self.jumpToSegment(
+                nextSegmentID,
+                labelRefreshReason="Delete button all-view check",
+            )
 
     def onRestoreButton(self, checked=False):
         """Show a chooser for logically deleted segments and restore the selected ones."""
@@ -1098,7 +1191,16 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
         firstRestoredSegmentID = restoredSegmentIDs[0]
         self._setCurrentSegmentIDWithoutAutoJump(firstRestoredSegmentID)
-        self.jumpToSegment(firstRestoredSegmentID)
+        self.debugSegmentLabelMessage(
+            "Restore button: restored={} target={}".format(
+                len(restoredSegmentIDs),
+                self.logic.segmentName(segmentationNode, firstRestoredSegmentID),
+            )
+        )
+        self.jumpToSegment(
+            firstRestoredSegmentID,
+            labelRefreshReason="Restore button all-view check",
+        )
         self._showShortcutMessage(
             "Restored {} logically deleted mucus plug segment(s).".format(
                 len(restoredSegmentIDs)
@@ -1277,7 +1379,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
                 writer.writerow([row["segmentName"], row["volumePixels"], row["lengthPixels"]])
         return len(rows), len(skippedRows)
 
-    def jumpToSegment(self, segmentID):
+    def jumpToSegment(self, segmentID, labelRefreshReason="Jump all-view check"):
         """Center slice views on a segment and apply the current jump zoom."""
         segmentationNode = self.segmentationNode()
         if not self.logic.isActiveSegmentID(segmentationNode, segmentID):
@@ -1295,15 +1397,17 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         finally:
             self._suppressSliceLabelRefresh = False
         if didJump:
-            self.refreshVisibleSegmentNameLabelsAfterSliceChange()
+            self.refreshVisibleSegmentNameLabelsAfterSliceChange(
+                reason=labelRefreshReason,
+            )
         else:
             self._hideCurrentSegmentNameLabel()
 
-    def refreshVisibleSegmentNameLabelsAfterSliceChange(self):
+    def refreshVisibleSegmentNameLabelsAfterSliceChange(self, reason="slice change full check"):
         """Run the complete current-slice segment-label decision after any slice move."""
         self.refreshVisibleSegmentNameLabelsForSliceNodes(
             self.currentSliceNodes(),
-            reason="slice change full check",
+            reason=reason,
         )
 
     def refreshVisibleSegmentNameLabelsForSliceNode(self, sliceNode, reason):
@@ -1874,11 +1978,41 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
     def onObservedSegmentationDisplayChanged(self, caller=None, event=None):
         """Refresh visibility controls when the segmentation display node changes."""
+        startTime = time.time()
+        isVisible = self.logic.isSegmentationVisible(self.segmentationNode())
+        if self._suppressSegmentationDisplayRefresh:
+            self.debugSegmentLabelMessage(
+                "Segmentation display observer: ignored during Hide/Show toggle"
+            )
+            return
+        self.debugSegmentLabelMessage(
+            "Segmentation display observer: event={} visible={}".format(
+                event,
+                "true" if isVisible else "false",
+            )
+        )
         self.updateSegmentCountAndButtons()
-        if self.logic.isSegmentationVisible(self.segmentationNode()):
+        if isVisible:
+            labelStartTime = time.time()
             self.refreshVisibleSegmentNameLabels()
+            self.debugSegmentLabelMessage(
+                "Segmentation display observer: label refresh took {:.3f}s".format(
+                    time.time() - labelStartTime
+                )
+            )
         else:
+            labelStartTime = time.time()
             self._hideCurrentSegmentNameLabel()
+            self.debugSegmentLabelMessage(
+                "Segmentation display observer: hiding labels took {:.3f}s".format(
+                    time.time() - labelStartTime
+                )
+            )
+        self.debugSegmentLabelMessage(
+            "Segmentation display observer: total took {:.3f}s".format(
+                time.time() - startTime
+            )
+        )
 
     def _observeSliceNodes(self):
         """Observe slice offset/orientation changes so visible labels follow scrolling."""
@@ -1974,8 +2108,10 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
                 )
             )
             return
-        self.debugSegmentLabelMessage("mouse wheel callback: running full check")
-        self.refreshVisibleSegmentNameLabelsAfterSliceChange()
+        self.debugSegmentLabelMessage("Mouse wheel: running all-view fallback check")
+        self.refreshVisibleSegmentNameLabelsAfterSliceChange(
+            reason="Mouse wheel all-view fallback check",
+        )
 
     def _startSliceChangePolling(self):
         """Start polling slice state as a fallback for missed scroll events."""
@@ -2040,14 +2176,15 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             )
         )
         if len(changedSliceNodes) == 1:
+            sliceName = self.sliceNodeNames(changedSliceNodes)
             self.refreshVisibleSegmentNameLabelsForSliceNode(
                 changedSliceNodes[0],
-                reason="slice polling single-view check",
+                reason="Scroll {} polling single-view check".format(sliceName),
             )
         else:
             self.refreshVisibleSegmentNameLabelsForSliceNodes(
                 changedSliceNodes if changedSliceNodes else self.currentSliceNodes(),
-                reason="slice polling multi-view check",
+                reason="Scroll polling multi-view check",
             )
 
     def currentSliceStateSignature(self):
@@ -2169,10 +2306,12 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         if caller and hasattr(caller, "GetSliceToRAS"):
             self.refreshVisibleSegmentNameLabelsForSliceNode(
                 caller,
-                reason="slice node single-view check",
+                reason="Scroll {} single-view check".format(callerName),
             )
         else:
-            self.refreshVisibleSegmentNameLabelsAfterSliceChange()
+            self.refreshVisibleSegmentNameLabelsAfterSliceChange(
+                reason="Slice node all-view fallback check",
+            )
 
 
 #
@@ -3761,12 +3900,20 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
         displayNode = segmentationNode.GetDisplayNode()
         if not displayNode:
             return
-        displayNode.SetVisibility(bool(visible))
-        if hasattr(displayNode, "SetVisibility2D"):
-            displayNode.SetVisibility2D(bool(visible))
-        if hasattr(displayNode, "SetVisibility3D"):
-            displayNode.SetVisibility3D(bool(visible))
-        displayNode.Modified()
+        wasModifying = None
+        if hasattr(displayNode, "StartModify"):
+            wasModifying = displayNode.StartModify()
+        try:
+            displayNode.SetVisibility(bool(visible))
+            if hasattr(displayNode, "SetVisibility2D"):
+                displayNode.SetVisibility2D(bool(visible))
+            if hasattr(displayNode, "SetVisibility3D"):
+                displayNode.SetVisibility3D(bool(visible))
+        finally:
+            if wasModifying is not None and hasattr(displayNode, "EndModify"):
+                displayNode.EndModify(wasModifying)
+            else:
+                displayNode.Modified()
 
     def ensureSegmentationVisible(self, segmentationNode):
         """Ensure the segmentation overlay is visible in 2D and globally visible."""

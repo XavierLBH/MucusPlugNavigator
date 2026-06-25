@@ -207,6 +207,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.countLabel = None
         self.volumeLabel = None
         self.lengthLabel = None
+        self.centerLabel = None
         self.zoomSpinBox = None
 
         self.jumpButton = None
@@ -261,6 +262,9 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
         self.lengthLabel = qt.QLabel("Length: - pixels")
         controlsLayout.addWidget(self.lengthLabel, 0, 2)
+
+        self.centerLabel = qt.QLabel("Center: -")
+        controlsLayout.addWidget(self.centerLabel, 0, 3)
 
         zoomLabel = qt.QLabel("Jump zoom:")
         controlsLayout.addWidget(zoomLabel, 1, 0)
@@ -1271,16 +1275,21 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
         self.volumeLabel.setText("Volume: calculating...")
         self.lengthLabel.setText("Length: calculating...")
+        self.centerLabel.setText("Center: calculating...")
         slicer.app.processEvents()
 
         metrics = self.logic.segmentVoxelMetrics(segmentationNode, segmentID, self.sourceVolumeNode())
         if not metrics:
             self.volumeLabel.setText("Volume: failed")
             self.lengthLabel.setText("Length: failed")
+            self.centerLabel.setText("Center: failed")
             return
 
         self.volumeLabel.setText("Volume: {} pixels".format(metrics["volumePixels"]))
         self.lengthLabel.setText("Length: {} pixels".format(metrics["lengthPixels"]))
+        self.centerLabel.setText(
+            "Center: {}".format(metrics["centerLPIText"])
+        )
 
     def onNoEditingButton(self, checked=False):
         """Deactivate the current Segment Editor effect."""
@@ -1883,6 +1892,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         """Clear measurement labels because the displayed values may no longer match the current segment."""
         self.volumeLabel.setText("Volume: not calculated")
         self.lengthLabel.setText("Length: not calculated")
+        self.centerLabel.setText("Center: not calculated")
 
     def _selectFirstSegmentIfNeeded(self):
         """Select the first active segment if the current segment is missing, invalid, or deleted."""
@@ -3012,19 +3022,87 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
             )
             return None
 
+        occupiedVoxelCoordinates = np.argwhere(occupiedMask)
+        centerLPIText = self.segmentCenterLPIText(
+            segmentationNode,
+            segmentID,
+            occupiedVoxelCoordinates,
+            np,
+        )
+
         if volumePixels == 0:
-            return {"volumePixels": 0, "lengthPixels": 0}
+            return {
+                "volumePixels": 0,
+                "lengthPixels": 0,
+                "centerLPIText": centerLPIText,
+            }
         if volumePixels == 1:
-            return {"volumePixels": volumePixels, "lengthPixels": 1}
+            return {
+                "volumePixels": volumePixels,
+                "lengthPixels": 1,
+                "centerLPIText": centerLPIText,
+            }
         if (
             skipLengthAbovePixels is not None
             and volumePixels >= skipLengthAbovePixels
         ):
-            return {"volumePixels": volumePixels, "lengthPixels": ""}
+            return {
+                "volumePixels": volumePixels,
+                "lengthPixels": "",
+                "centerLPIText": centerLPIText,
+            }
 
-        occupiedVoxelCoordinates = np.argwhere(occupiedMask)
         lengthPixels = self._principalAxisLengthPixels(occupiedVoxelCoordinates, np)
-        return {"volumePixels": volumePixels, "lengthPixels": max(lengthPixels, 1)}
+        return {
+            "volumePixels": volumePixels,
+            "lengthPixels": max(lengthPixels, 1),
+            "centerLPIText": centerLPIText,
+        }
+
+    def segmentCenterLPIText(
+        self,
+        segmentationNode,
+        segmentID,
+        occupiedVoxelCoordinates,
+        np,
+    ):
+        """Return the segment pixel-center coordinate formatted as anatomical LPI text."""
+        if occupiedVoxelCoordinates.size == 0:
+            return "not available"
+        try:
+            imageData = self.segmentBinaryLabelmapRepresentation(
+                segmentationNode,
+                segmentID,
+            )
+            occupiedVoxelCoordinates = self.occupiedImageVoxelCoordinates(
+                imageData,
+                np,
+            )
+            if occupiedVoxelCoordinates.size == 0:
+                return "not available"
+            pointData = self.imageVoxelPointDataRAS(
+                occupiedVoxelCoordinates,
+                imageData,
+                np,
+            )
+            pointsRAS = pointData.get("pointsRAS") if pointData else None
+            if pointsRAS is None or pointsRAS.size == 0:
+                return "not available"
+            centerRAS = pointsRAS.mean(axis=0)
+            return self.formatAnatomicalCoordinate(centerRAS)
+        except Exception:
+            logging.debug("Could not calculate segment center coordinate", exc_info=True)
+            return "not available"
+
+    def formatAnatomicalCoordinate(self, rasCoordinate):
+        """Format an RAS coordinate using Slicer's L/R, P/A, I/S display style."""
+        axisLabels = (("R", "L"), ("A", "P"), ("S", "I"))
+        parts = []
+        for value, labels in zip(rasCoordinate, axisLabels):
+            positiveLabel, negativeLabel = labels
+            label = positiveLabel if value >= 0 else negativeLabel
+            parts.append("{} {:.1f}".format(label, abs(float(value))))
+        return ", ".join(parts)
 
     def _segmentArray(self, segmentationNode, segmentID, referenceVolumeNode):
         """Return a binary labelmap array for one segment, using the source volume when needed."""

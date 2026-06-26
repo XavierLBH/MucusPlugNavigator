@@ -103,7 +103,8 @@ behavior.
 - `Show 3D`: toggle 3D display for the selected segmentation.
 - `Hide Seg`: hide or show the whole segmentation in 2D and 3D.
 - `Delete`: logically delete only the selected mucus plug segment.
-- `Measure`: calculate volume and length for the selected mucus plug.
+- `Measure`: calculate volume, length, and median CT value for the selected
+  mucus plug.
 - `No editing`: turn off the active Segment Editor effect.
 - `Paint`: activate Segment Editor Paint.
 - `Erase`: activate Segment Editor Erase.
@@ -138,6 +139,8 @@ Displayed values:
 
 - `Volume`: number of non-zero pixels/voxels in the selected segment labelmap.
 - `Length`: estimated main-axis length in pixels.
+- `Median CT`: median source CT scalar value across all voxels inside the
+  selected mucus plug.
 
 `Export` calculates measurements for all active segments and writes a CSV file:
 

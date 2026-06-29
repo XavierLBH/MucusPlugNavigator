@@ -396,7 +396,10 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.nextButton.connect("clicked(bool)", self.onNextButton)
         self.addButton.connect("clicked(bool)", self.onAddButton)
         self.show3DButton.connect("clicked(bool)", self.onShow3DButton)
-        self.visibilityButton.connect("clicked(bool)", self.onSegmentationVisibilityButton)
+        self.visibilityButton.connect(
+            "clicked(bool)",
+            self.onSegmentationVisibilityButton,
+        )
         self.deleteButton.connect("clicked(bool)", self.onDeleteButton)
         self.restoreButton.connect("clicked(bool)", self.onRestoreButton)
         self.measureButton.connect("clicked(bool)", self.onMeasureButton)
@@ -467,8 +470,14 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.visibilityShortcut.setContext(qt.Qt.ApplicationShortcut)
         if hasattr(self.visibilityShortcut, "setAutoRepeat"):
             self.visibilityShortcut.setAutoRepeat(False)
-        self.visibilityShortcut.connect("activated()", self.onSegmentationVisibilityShortcut)
-        self.visibilityShortcut.connect("activatedAmbiguously()", self.onSegmentationVisibilityShortcut)
+        self.visibilityShortcut.connect(
+            "activated()",
+            self.onSegmentationVisibilityShortcut,
+        )
+        self.visibilityShortcut.connect(
+            "activatedAmbiguously()",
+            self.onSegmentationVisibilityShortcut,
+        )
 
     def _createNavigationShortcuts(self):
         """Bind Left and Right Arrow keys to the Last and Next navigation buttons."""
@@ -627,7 +636,10 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
     def _getOrCreateSegmentEditorNode(self):
         """Return the singleton Segment Editor parameter node used by this module."""
-        node = slicer.mrmlScene.GetSingletonNode(SEGMENT_EDITOR_SINGLETON_TAG, "vtkMRMLSegmentEditorNode")
+        node = slicer.mrmlScene.GetSingletonNode(
+            SEGMENT_EDITOR_SINGLETON_TAG,
+            "vtkMRMLSegmentEditorNode",
+        )
         if node:
             return node
 
@@ -658,7 +670,9 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         if hasattr(self.segmentEditorWidget, "setUnorderedEffectsVisible"):
             self.segmentEditorWidget.setUnorderedEffectsVisible(False)
         if hasattr(self.segmentEditorWidget, "setEffectButtonStyle"):
-            self.segmentEditorWidget.setEffectButtonStyle(qt.Qt.ToolButtonTextBesideIcon)
+            self.segmentEditorWidget.setEffectButtonStyle(
+                qt.Qt.ToolButtonTextBesideIcon
+            )
         if hasattr(self.segmentEditorWidget, "setEffectColumnCount"):
             self.segmentEditorWidget.setEffectColumnCount(2)
         if hasattr(self.segmentEditorWidget, "updateEffectList"):
@@ -682,13 +696,28 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
         self._copyButtonIconSize(addButton, self.addButton)
         self._copyButtonIconSize(show3DButton, self.show3DButton)
-        self._copyButtonIconSize(show3DButton if show3DButton else addButton, self.visibilityButton)
-        self._copyButtonIconSize(removeButton if removeButton else addButton, self.deleteButton)
+        self._copyButtonIconSize(
+            show3DButton if show3DButton else addButton,
+            self.visibilityButton,
+        )
+        self._copyButtonIconSize(
+            removeButton if removeButton else addButton,
+            self.deleteButton,
+        )
         self._copyButtonIconSize(addButton, self.restoreButton)
         self._copyButtonIconSize(addButton, self.measureButton)
-        self._copyButtonIconSize(noneButton if noneButton else addButton, self.noEditingButton)
-        self._copyButtonIconSize(paintButton if paintButton else addButton, self.paintButton)
-        self._copyButtonIconSize(eraseButton if eraseButton else addButton, self.eraseButton)
+        self._copyButtonIconSize(
+            noneButton if noneButton else addButton,
+            self.noEditingButton,
+        )
+        self._copyButtonIconSize(
+            paintButton if paintButton else addButton,
+            self.paintButton,
+        )
+        self._copyButtonIconSize(
+            eraseButton if eraseButton else addButton,
+            self.eraseButton,
+        )
         self._copyButtonIconSize(addButton, self.exportButton)
         self._copyButtonIconSize(addButton, self.jumpButton)
         self._copyButtonIconSize(addButton, self.lastButton)
@@ -718,7 +747,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             logging.debug("Could not copy Segment Editor effect icon", exc_info=True)
 
     def _copyButtonIconSize(self, sourceButton, targetButton):
-        """Copy only the icon size from a Segment Editor button, avoiding layout size constraints."""
+        """Copy icon size from Segment Editor without copying layout constraints."""
         if not sourceButton:
             return
         try:
@@ -738,7 +767,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             self.segmentEditorWidget.setShow3DButtonVisible(False)
 
     def _hideSegmentEditorEffectButtons(self):
-        """Hide the original effect grid so only the custom No editing, Paint, and Erase buttons are visible."""
+        """Hide the original effect grid so only the custom edit buttons show."""
         effectButtonTexts = {
             "None",
             "Paint",
@@ -1118,7 +1147,11 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             return
         self.debugSegmentLabelMessage("H shortcut: pressed")
         visible = self.onSegmentationVisibilityButton()
-        self._showShortcutMessage("Mucus segmentation is now {}.".format("visible" if visible else "hidden"))
+        self._showShortcutMessage(
+            "Mucus segmentation is now {}.".format(
+                "visible" if visible else "hidden"
+            )
+        )
 
     def onDeleteButton(self, checked=False):
         """Logically delete the current segment by moving it to the hidden restore backup."""
@@ -1340,7 +1373,10 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
     def _isPermissionDeniedError(self, exception):
         """Return True when export failed because the target file cannot be written."""
-        return isinstance(exception, PermissionError) or getattr(exception, "errno", None) == 13
+        return (
+            isinstance(exception, PermissionError)
+            or getattr(exception, "errno", None) == 13
+        )
 
     def _showExportPermissionError(self, filePath):
         """Show a clear export error when the CSV file is locked or read-only."""
@@ -1383,14 +1419,23 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
     def _writeMeasurementsCsv(self, filePath, segmentationNode):
         """Write the measurement CSV using the requested count and per-segment rows."""
-        rows, skippedRows = self.logic.exportMucusPlugMeasurementRows(segmentationNode, self.sourceVolumeNode())
+        rows, skippedRows = self.logic.exportMucusPlugMeasurementRows(
+            segmentationNode,
+            self.sourceVolumeNode(),
+        )
         with open(filePath, "w", newline="") as csvFile:
             writer = csv.writer(csvFile)
             writer.writerow(["Mucus plug count", len(rows)])
             writer.writerow([])
             writer.writerow(["Segment", "Volume", "Length"])
             for row in rows:
-                writer.writerow([row["segmentName"], row["volumePixels"], row["lengthPixels"]])
+                writer.writerow(
+                    [
+                        row["segmentName"],
+                        row["volumePixels"],
+                        row["lengthPixels"],
+                    ]
+                )
         return len(rows), len(skippedRows)
 
     def jumpToSegment(self, segmentID, labelRefreshReason="Jump all-view check"):
@@ -1873,7 +1918,10 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.countLabel.setText("Mucus plug count: {}".format(count))
 
         hasSegments = count > 0
-        hasCurrentSegment = self.logic.isActiveSegmentID(segmentationNode, self.currentSegmentID())
+        hasCurrentSegment = self.logic.isActiveSegmentID(
+            segmentationNode,
+            self.currentSegmentID(),
+        )
         hasSegmentation = segmentationNode is not None
 
         self.addButton.enabled = hasSegmentation
@@ -1894,13 +1942,13 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.eraseButton.enabled = hasCurrentSegment
 
     def resetCurrentSegmentMeasurements(self):
-        """Clear measurement labels because the displayed values may no longer match the current segment."""
+        """Clear stale measurement labels for the current segment."""
         self.volumeLabel.setText("Volume: not calculated")
         self.lengthLabel.setText("Length: not calculated")
         self.ctValueLabel.setText("Median CT: not calculated")
 
     def _selectFirstSegmentIfNeeded(self):
-        """Select the first active segment if the current segment is missing, invalid, or deleted."""
+        """Select the first active segment when the current one is invalid."""
         segmentationNode = self.segmentationNode()
         if not segmentationNode:
             return
@@ -1955,7 +2003,12 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         events = [vtk.vtkCommand.ModifiedEvent]
         vtkSegmentationClass = getattr(slicer, "vtkSegmentation", None)
         if vtkSegmentationClass:
-            for eventName in ("SegmentAdded", "SegmentRemoved", "SegmentModified", "SegmentsOrderModified"):
+            for eventName in (
+                "SegmentAdded",
+                "SegmentRemoved",
+                "SegmentModified",
+                "SegmentsOrderModified",
+            ):
                 if hasattr(vtkSegmentationClass, eventName):
                     events.append(getattr(vtkSegmentationClass, eventName))
 
@@ -1974,13 +2027,16 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self._segmentationObserverTags = []
 
     def _observeSegmentationDisplayNode(self, segmentationNode):
-        """Observe display-node visibility changes so the custom visibility button stays current."""
+        """Keep the custom visibility button synced with Slicer's display node."""
         segmentationNode.CreateDefaultDisplayNodes()
         displayNode = segmentationNode.GetDisplayNode()
         if not displayNode:
             return
         self._observedDisplayNode = displayNode
-        tag = displayNode.AddObserver(vtk.vtkCommand.ModifiedEvent, self.onObservedSegmentationDisplayChanged)
+        tag = displayNode.AddObserver(
+            vtk.vtkCommand.ModifiedEvent,
+            self.onObservedSegmentationDisplayChanged,
+        )
         self._displayNodeObserverTags.append(tag)
 
     def _removeSegmentationDisplayObservers(self):
@@ -2531,7 +2587,7 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
         return remainingSegmentIDs[min(removedIndex, len(remainingSegmentIDs) - 1)]
 
     def restoreLogicallyDeletedSegments(self, segmentationNode, segmentIDs=None):
-        """Move selected deleted segments from the hidden backup node back to the active segmentation."""
+        """Move selected deleted segments back to the active segmentation."""
         deletedSegmentIDs = self.logicallyDeletedSegmentIDs(segmentationNode)
         if segmentIDs is None:
             restoredSegmentIDs = deletedSegmentIDs
@@ -2581,7 +2637,7 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
         displayNode.Modified()
 
     def moveSegmentToDeletedBackup(self, segmentationNode, segmentID):
-        """Copy a segment into the hidden deleted backup node and remove it from the active segmentation."""
+        """Copy a segment to the backup node and remove it from the active list."""
         backupNode = self.deletedBackupNode(segmentationNode, create=True)
         if not backupNode:
             return False
@@ -2620,7 +2676,7 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
         segmentID,
         targetSegmentID=None,
     ):
-        """Copy one segment between segmentation nodes while preserving its segment ID when possible."""
+        """Copy one segment between segmentation nodes."""
         if (
             not self.isValidSegmentID(sourceSegmentationNode, segmentID)
             or not targetSegmentationNode
@@ -2778,7 +2834,7 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
             suffix += 1
 
     def deletedBackupNode(self, segmentationNode, create=False):
-        """Return the hidden segmentation node used to keep logically deleted segments restorable."""
+        """Return the hidden backup node for logically deleted segments."""
         if not segmentationNode:
             return None
         backupNode = None
@@ -2950,7 +3006,12 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
             segmentationNode.SetAttribute(LOGICALLY_DELETED_SEGMENTS_ATTRIBUTE, None)
         segmentationNode.Modified()
 
-    def mucusPlugMeasurementRows(self, segmentationNode, referenceVolumeNode=None, skipLengthAbovePixels=None):
+    def mucusPlugMeasurementRows(
+        self,
+        segmentationNode,
+        referenceVolumeNode=None,
+        skipLengthAbovePixels=None,
+    ):
         """Return CSV-ready measurement rows for every segment in segmentation order."""
         rows = []
         if not segmentationNode:
@@ -2993,7 +3054,7 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
         return exportRows, skippedRows
 
     def _isMaskLikeExportRow(self, row):
-        """Return True when an export row looks like a whole-mask segment instead of a mucus plug."""
+        """Return True when a row looks like a whole-mask segment."""
         try:
             return int(row["volumePixels"]) >= EXPORT_MASK_MIN_VOLUME_PIXELS
         except Exception:
@@ -3943,10 +4004,15 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
                         slicer.util.resetSliceViews()
                         resetAllViewsUsed = True
                     except Exception:
-                        logging.debug("Could not reset slice field of view before applying jump zoom", exc_info=True)
+                        logging.debug(
+                            "Could not reset slice field of view before applying jump zoom",
+                            exc_info=True,
+                        )
 
         for sliceNode in slicer.util.getNodesByClass("vtkMRMLSliceNode"):
-            baseFieldOfViewBySliceNodeID[sliceNode.GetID()] = list(sliceNode.GetFieldOfView())
+            baseFieldOfViewBySliceNodeID[sliceNode.GetID()] = list(
+                sliceNode.GetFieldOfView()
+            )
 
     def ensureSourceVolumeVisible(self, sourceVolumeNode):
         """Set the selected source volume as the slice-view background."""
@@ -3956,7 +4022,10 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
             slicer.util.setSliceViewerLayers(background=sourceVolumeNode, fit=False)
             return
         except Exception:
-            logging.debug("setSliceViewerLayers failed; falling back to slice composite nodes", exc_info=True)
+            logging.debug(
+                "setSliceViewerLayers failed; falling back to slice composite nodes",
+                exc_info=True,
+            )
 
         for compositeNode in slicer.util.getNodesByClass("vtkMRMLSliceCompositeNode"):
             compositeNode.SetBackgroundVolumeID(sourceVolumeNode.GetID())

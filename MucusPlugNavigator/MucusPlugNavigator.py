@@ -208,6 +208,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.volumeLabel = None
         self.lengthLabel = None
         self.ctValueLabel = None
+        self.spacingLabel = None
         self.zoomSpinBox = None
 
         self.jumpButton = None
@@ -265,6 +266,12 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
         self.ctValueLabel = qt.QLabel("Median CT: -")
         controlsLayout.addWidget(self.ctValueLabel, 0, 3)
+
+        self.spacingLabel = qt.QLabel("Voxel spacing: -")
+        self.spacingLabel.setToolTip(
+            "Voxel spacing of the selected source CT volume in millimeters."
+        )
+        controlsLayout.addWidget(self.spacingLabel, 0, 4)
 
         zoomLabel = qt.QLabel("Jump zoom:")
         controlsLayout.addWidget(zoomLabel, 1, 0)
@@ -889,6 +896,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             self.segmentEditorWidget.setMasterVolumeNode(sourceVolumeNode)
         self.logic.ensureSourceVolumeVisible(sourceVolumeNode)
         self._sliceBaseFieldOfViewByID = {}
+        self.updateSourceVoxelSpacing()
         self.resetCurrentSegmentMeasurements()
         self.updateSegmentCountAndButtons()
 
@@ -1342,7 +1350,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.segmentEditorWidget.setActiveEffectByName("Erase")
 
     def onExportButton(self, checked=False):
-        """Export all segment names, volumes, and lengths to a CSV file."""
+        """Export active segment names, measurements, and CT spacing to CSV."""
         segmentationNode = self.segmentationNode()
         segmentIDs = self.logic.activeSegmentIDs(segmentationNode)
         if not segmentIDs:
@@ -1355,8 +1363,14 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
         self._setExportInProgress(True)
         try:
-            exportedCount, skippedCount = self._writeMeasurementsCsv(filePath, segmentationNode)
-            message = "Exported {} mucus plug measurements to:\n{}".format(exportedCount, filePath)
+            exportedCount, skippedCount = self._writeMeasurementsCsv(
+                filePath,
+                segmentationNode,
+            )
+            message = "Exported {} mucus plug measurements to:\n{}".format(
+                exportedCount,
+                filePath,
+            )
             if skippedCount:
                 message += "\n\nSkipped {} large mask-like segment(s).".format(skippedCount)
             slicer.util.infoDisplay(message)
@@ -1419,21 +1433,27 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
     def _writeMeasurementsCsv(self, filePath, segmentationNode):
         """Write the measurement CSV using the requested count and per-segment rows."""
+        sourceVolumeNode = self.sourceVolumeNode()
         rows, skippedRows = self.logic.exportMucusPlugMeasurementRows(
             segmentationNode,
-            self.sourceVolumeNode(),
+            sourceVolumeNode,
         )
         with open(filePath, "w", newline="") as csvFile:
             writer = csv.writer(csvFile)
             writer.writerow(["Mucus plug count", len(rows)])
+            writer.writerow(
+                ["Source voxel spacing (mm)"]
+                + self.logic.volumeSpacingTextValues(sourceVolumeNode)
+            )
             writer.writerow([])
-            writer.writerow(["Segment", "Volume", "Length"])
+            writer.writerow(["Segment", "Volume", "Length", "Median CT"])
             for row in rows:
                 writer.writerow(
                     [
                         row["segmentName"],
                         row["volumePixels"],
                         row["lengthPixels"],
+                        row["medianCTValueText"],
                     ]
                 )
         return len(rows), len(skippedRows)
@@ -1946,6 +1966,14 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.volumeLabel.setText("Volume: not calculated")
         self.lengthLabel.setText("Length: not calculated")
         self.ctValueLabel.setText("Median CT: not calculated")
+
+    def updateSourceVoxelSpacing(self):
+        """Show selected source CT voxel spacing in millimeters."""
+        self.spacingLabel.setText(
+            "Voxel spacing: {}".format(
+                self.logic.volumeSpacingText(self.sourceVolumeNode())
+            )
+        )
 
     def _selectFirstSegmentIfNeeded(self):
         """Select the first active segment when the current one is invalid."""
@@ -3011,6 +3039,7 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
         segmentationNode,
         referenceVolumeNode=None,
         skipLengthAbovePixels=None,
+        includeMedianCTValue=False,
     ):
         """Return CSV-ready measurement rows for every segment in segmentation order."""
         rows = []
@@ -3026,6 +3055,7 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
                 segmentID,
                 referenceVolumeNode,
                 skipLengthAbovePixels,
+                includeMedianCTValue,
             )
             rows.append(
                 {
@@ -3033,6 +3063,9 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
                     "segmentName": segmentName,
                     "volumePixels": metrics["volumePixels"] if metrics else "",
                     "lengthPixels": metrics["lengthPixels"] if metrics else "",
+                    "medianCTValueText": (
+                        metrics["medianCTValueText"] if metrics else ""
+                    ),
                 }
             )
         return rows
@@ -3043,6 +3076,7 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
             segmentationNode,
             referenceVolumeNode,
             skipLengthAbovePixels=EXPORT_MASK_MIN_VOLUME_PIXELS,
+            includeMedianCTValue=True,
         )
         exportRows = []
         skippedRows = []
@@ -3089,6 +3123,22 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
             )
             return None
 
+        if volumePixels == 0:
+            return {
+                "volumePixels": 0,
+                "lengthPixels": 0,
+                "medianCTValueText": "not available",
+            }
+        if (
+            skipLengthAbovePixels is not None
+            and volumePixels >= skipLengthAbovePixels
+        ):
+            return {
+                "volumePixels": volumePixels,
+                "lengthPixels": "",
+                "medianCTValueText": "",
+            }
+
         medianCTValueText = ""
         if includeMedianCTValue:
             medianCTValueText = self.segmentMedianCTValueText(
@@ -3098,25 +3148,10 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
                 np,
             )
 
-        if volumePixels == 0:
-            return {
-                "volumePixels": 0,
-                "lengthPixels": 0,
-                "medianCTValueText": medianCTValueText,
-            }
         if volumePixels == 1:
             return {
                 "volumePixels": volumePixels,
                 "lengthPixels": 1,
-                "medianCTValueText": medianCTValueText,
-            }
-        if (
-            skipLengthAbovePixels is not None
-            and volumePixels >= skipLengthAbovePixels
-        ):
-            return {
-                "volumePixels": volumePixels,
-                "lengthPixels": "",
                 "medianCTValueText": medianCTValueText,
             }
 
@@ -3127,6 +3162,24 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
             "lengthPixels": max(lengthPixels, 1),
             "medianCTValueText": medianCTValueText,
         }
+
+    def volumeSpacingText(self, volumeNode):
+        """Return source volume voxel spacing as readable millimeter text."""
+        values = self.volumeSpacingTextValues(volumeNode)
+        if not values:
+            return "not available"
+        return "{} x {} x {} mm".format(values[0], values[1], values[2])
+
+    def volumeSpacingTextValues(self, volumeNode):
+        """Return source volume spacing values formatted for UI and CSV."""
+        if not volumeNode:
+            return []
+        try:
+            spacing = volumeNode.GetSpacing()
+            return [self.formatScalarValue(spacing[index]) for index in range(3)]
+        except Exception:
+            logging.debug("Could not read source volume spacing", exc_info=True)
+            return []
 
     def segmentMedianCTValueText(
         self,

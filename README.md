@@ -1,3 +1,4 @@
+
 # Mucus Plug Navigator
 
 `MucusPlugNavigator` is a 3D Slicer scripted module for reviewing mucus plug

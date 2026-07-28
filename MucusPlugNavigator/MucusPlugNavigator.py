@@ -258,10 +258,10 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.countLabel.setMinimumWidth(150)
         controlsLayout.addWidget(self.countLabel, 0, 0)
 
-        self.volumeLabel = qt.QLabel("Volume: - pixels")
+        self.volumeLabel = qt.QLabel("Volume: - voxels")
         controlsLayout.addWidget(self.volumeLabel, 0, 1)
 
-        self.lengthLabel = qt.QLabel("Length: - pixels")
+        self.lengthLabel = qt.QLabel("Length: - voxels")
         controlsLayout.addWidget(self.lengthLabel, 0, 2)
 
         self.ctValueLabel = qt.QLabel("Median CT: -")
@@ -366,7 +366,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
         self.exportButton = self._createButton(
             "Export",
-            "Export segment name, volume, and length for all mucus plugs to a CSV file.",
+            "Export mucus plug measurements and source spacing to a CSV file.",
         )
         segmentToolbarLayout.addWidget(self.exportButton, 1, 3)
 
@@ -1331,8 +1331,18 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             self.ctValueLabel.setText("Median CT: failed")
             return
 
-        self.volumeLabel.setText("Volume: {} pixels".format(metrics["volumePixels"]))
-        self.lengthLabel.setText("Length: {} pixels".format(metrics["lengthPixels"]))
+        self.volumeLabel.setText(
+            "Volume: {} voxels / {} mm3".format(
+                metrics["volumePixels"],
+                metrics["volumeMm3Text"],
+            )
+        )
+        self.lengthLabel.setText(
+            "Length: {} voxels / {} mm".format(
+                metrics["lengthPixels"],
+                metrics["lengthMmText"],
+            )
+        )
         self.ctValueLabel.setText(
             "Median CT: {}".format(metrics["medianCTValueText"])
         )
@@ -1446,13 +1456,24 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
                 + self.logic.volumeSpacingTextValues(sourceVolumeNode)
             )
             writer.writerow([])
-            writer.writerow(["Segment", "Volume", "Length", "Median CT"])
+            writer.writerow(
+                [
+                    "Segment",
+                    "Volume (voxels)",
+                    "Volume (mm3)",
+                    "Length (voxels)",
+                    "Length (mm)",
+                    "Median CT",
+                ]
+            )
             for row in rows:
                 writer.writerow(
                     [
                         row["segmentName"],
                         row["volumePixels"],
+                        row["volumeMm3Text"],
                         row["lengthPixels"],
+                        row["lengthMmText"],
                         row["medianCTValueText"],
                     ]
                 )
@@ -3062,7 +3083,11 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
                     "segmentID": segmentID,
                     "segmentName": segmentName,
                     "volumePixels": metrics["volumePixels"] if metrics else "",
+                    "volumeMm3Text": (
+                        metrics["volumeMm3Text"] if metrics else ""
+                    ),
                     "lengthPixels": metrics["lengthPixels"] if metrics else "",
+                    "lengthMmText": metrics["lengthMmText"] if metrics else "",
                     "medianCTValueText": (
                         metrics["medianCTValueText"] if metrics else ""
                     ),
@@ -3116,6 +3141,10 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
             )
             occupiedMask = segmentArray != 0
             volumePixels = int(np.count_nonzero(occupiedMask))
+            volumeMm3Text = self.physicalVolumeMm3Text(
+                volumePixels,
+                referenceVolumeNode,
+            )
         except Exception:
             logging.exception(
                 "Could not compute segment voxel measurements for segment: %s",
@@ -3126,7 +3155,9 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
         if volumePixels == 0:
             return {
                 "volumePixels": 0,
+                "volumeMm3Text": volumeMm3Text,
                 "lengthPixels": 0,
+                "lengthMmText": "not available",
                 "medianCTValueText": "not available",
             }
         if (
@@ -3135,7 +3166,9 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
         ):
             return {
                 "volumePixels": volumePixels,
+                "volumeMm3Text": volumeMm3Text,
                 "lengthPixels": "",
+                "lengthMmText": "",
                 "medianCTValueText": "",
             }
 
@@ -3151,17 +3184,41 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
         if volumePixels == 1:
             return {
                 "volumePixels": volumePixels,
+                "volumeMm3Text": volumeMm3Text,
                 "lengthPixels": 1,
+                "lengthMmText": self.singleVoxelLengthMmText(referenceVolumeNode),
                 "medianCTValueText": medianCTValueText,
             }
 
         occupiedVoxelCoordinates = np.argwhere(occupiedMask)
         lengthPixels = self._principalAxisLengthPixels(occupiedVoxelCoordinates, np)
+        lengthMmText = self._principalAxisLengthMmText(
+            occupiedVoxelCoordinates,
+            referenceVolumeNode,
+            np,
+        )
         return {
             "volumePixels": volumePixels,
+            "volumeMm3Text": volumeMm3Text,
             "lengthPixels": max(lengthPixels, 1),
+            "lengthMmText": lengthMmText,
             "medianCTValueText": medianCTValueText,
         }
+
+    def physicalVolumeMm3Text(self, volumePixels, volumeNode):
+        """Return physical volume in mm3 using source voxel spacing."""
+        spacing = self.volumeSpacingValues(volumeNode)
+        if not spacing:
+            return "not available"
+        voxelVolumeMm3 = spacing[0] * spacing[1] * spacing[2]
+        return self.formatPhysicalMeasurement(volumePixels * voxelVolumeMm3)
+
+    def singleVoxelLengthMmText(self, volumeNode):
+        """Return a one-voxel length estimate in millimeters."""
+        spacing = self.volumeSpacingValues(volumeNode)
+        if not spacing:
+            return "not available"
+        return self.formatPhysicalMeasurement(max(spacing))
 
     def volumeSpacingText(self, volumeNode):
         """Return source volume voxel spacing as readable millimeter text."""
@@ -3172,14 +3229,21 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
 
     def volumeSpacingTextValues(self, volumeNode):
         """Return source volume spacing values formatted for UI and CSV."""
-        if not volumeNode:
+        spacing = self.volumeSpacingValues(volumeNode)
+        if not spacing:
             return []
+        return [self.formatScalarValue(value) for value in spacing]
+
+    def volumeSpacingValues(self, volumeNode):
+        """Return source volume spacing as numeric X, Y, Z millimeter values."""
+        if not volumeNode:
+            return None
         try:
             spacing = volumeNode.GetSpacing()
-            return [self.formatScalarValue(spacing[index]) for index in range(3)]
+            return [float(spacing[index]) for index in range(3)]
         except Exception:
             logging.debug("Could not read source volume spacing", exc_info=True)
-            return []
+            return None
 
     def segmentMedianCTValueText(
         self,
@@ -3218,6 +3282,10 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
         if abs(float(value) - roundedValue) < 1e-6:
             return str(int(roundedValue))
         return "{:.3f}".format(float(value))
+
+    def formatPhysicalMeasurement(self, value):
+        """Format a physical measurement without unnecessary trailing zeros."""
+        return "{:.3f}".format(float(value)).rstrip("0").rstrip(".")
 
     def _segmentArray(self, segmentationNode, segmentID, referenceVolumeNode):
         """Return a binary labelmap array for one segment, using the source volume when needed."""
@@ -3287,6 +3355,51 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
                 + 1
             )
             return int(voxelDimensions.max())
+
+    def _principalAxisLengthMmText(
+        self,
+        occupiedVoxelCoordinates,
+        volumeNode,
+        np,
+    ):
+        """Estimate segment length in millimeters along the principal axis."""
+        spacingKji = self.volumeSpacingKjiValues(volumeNode)
+        if not spacingKji:
+            return "not available"
+
+        physicalCoordinates = occupiedVoxelCoordinates * np.array(spacingKji)
+        centeredCoordinates = (
+            physicalCoordinates - physicalCoordinates.mean(axis=0)
+        )
+        try:
+            _, _, principalAxes = np.linalg.svd(
+                centeredCoordinates,
+                full_matrices=False,
+            )
+            principalAxis = principalAxes[0]
+            projectedCoordinates = physicalCoordinates.dot(principalAxis)
+            voxelWidthMm = np.abs(principalAxis).dot(np.array(spacingKji))
+            lengthMm = (
+                projectedCoordinates.max()
+                - projectedCoordinates.min()
+                + voxelWidthMm
+            )
+            return self.formatPhysicalMeasurement(lengthMm)
+        except Exception:
+            voxelDimensions = (
+                occupiedVoxelCoordinates.max(axis=0)
+                - occupiedVoxelCoordinates.min(axis=0)
+                + 1
+            )
+            lengthMm = (voxelDimensions * np.array(spacingKji)).max()
+            return self.formatPhysicalMeasurement(lengthMm)
+
+    def volumeSpacingKjiValues(self, volumeNode):
+        """Return source spacing in NumPy array coordinate order: K, J, I."""
+        spacing = self.volumeSpacingValues(volumeNode)
+        if not spacing:
+            return None
+        return [spacing[2], spacing[1], spacing[0]]
 
     def isValidSegmentID(self, segmentationNode, segmentID):
         """Return True if the segment ID exists in the selected segmentation."""

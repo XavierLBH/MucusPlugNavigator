@@ -208,6 +208,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.volumeLabel = None
         self.lengthLabel = None
         self.ctValueLabel = None
+        self.meanCtValueLabel = None
         self.spacingLabel = None
         self.zoomSpinBox = None
 
@@ -267,11 +268,14 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.ctValueLabel = qt.QLabel("Median CT: -")
         controlsLayout.addWidget(self.ctValueLabel, 0, 3)
 
+        self.meanCtValueLabel = qt.QLabel("Mean CT: -")
+        controlsLayout.addWidget(self.meanCtValueLabel, 0, 4)
+
         self.spacingLabel = qt.QLabel("Voxel spacing: -")
         self.spacingLabel.setToolTip(
             "Voxel spacing of the selected source CT volume in millimeters."
         )
-        controlsLayout.addWidget(self.spacingLabel, 0, 4)
+        controlsLayout.addWidget(self.spacingLabel, 0, 5)
 
         zoomLabel = qt.QLabel("Jump zoom:")
         controlsLayout.addWidget(zoomLabel, 1, 0)
@@ -1317,6 +1321,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.volumeLabel.setText("Volume: calculating...")
         self.lengthLabel.setText("Length: calculating...")
         self.ctValueLabel.setText("Median CT: calculating...")
+        self.meanCtValueLabel.setText("Mean CT: calculating...")
         slicer.app.processEvents()
 
         metrics = self.logic.segmentVoxelMetrics(
@@ -1329,6 +1334,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             self.volumeLabel.setText("Volume: failed")
             self.lengthLabel.setText("Length: failed")
             self.ctValueLabel.setText("Median CT: failed")
+            self.meanCtValueLabel.setText("Mean CT: failed")
             return
 
         self.volumeLabel.setText(
@@ -1345,6 +1351,9 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         )
         self.ctValueLabel.setText(
             "Median CT: {}".format(metrics["medianCTValueText"])
+        )
+        self.meanCtValueLabel.setText(
+            "Mean CT: {}".format(metrics["meanCTValueText"])
         )
 
     def onNoEditingButton(self, checked=False):
@@ -1464,6 +1473,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
                     "Length (voxels)",
                     "Length (mm)",
                     "Median CT",
+                    "Mean CT",
                 ]
             )
             for row in rows:
@@ -1475,6 +1485,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
                         row["lengthPixels"],
                         row["lengthMmText"],
                         row["medianCTValueText"],
+                        row["meanCTValueText"],
                     ]
                 )
         return len(rows), len(skippedRows)
@@ -1987,6 +1998,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.volumeLabel.setText("Volume: not calculated")
         self.lengthLabel.setText("Length: not calculated")
         self.ctValueLabel.setText("Median CT: not calculated")
+        self.meanCtValueLabel.setText("Mean CT: not calculated")
 
     def updateSourceVoxelSpacing(self):
         """Show selected source CT voxel spacing in millimeters."""
@@ -3091,6 +3103,9 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
                     "medianCTValueText": (
                         metrics["medianCTValueText"] if metrics else ""
                     ),
+                    "meanCTValueText": (
+                        metrics["meanCTValueText"] if metrics else ""
+                    ),
                 }
             )
         return rows
@@ -3159,6 +3174,7 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
                 "lengthPixels": 0,
                 "lengthMmText": "not available",
                 "medianCTValueText": "not available",
+                "meanCTValueText": "not available",
             }
         if (
             skipLengthAbovePixels is not None
@@ -3170,16 +3186,20 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
                 "lengthPixels": "",
                 "lengthMmText": "",
                 "medianCTValueText": "",
+                "meanCTValueText": "",
             }
 
         medianCTValueText = ""
+        meanCTValueText = ""
         if includeMedianCTValue:
-            medianCTValueText = self.segmentMedianCTValueText(
+            ctValueTexts = self.segmentCTValueTexts(
                 segmentationNode,
                 segmentID,
                 referenceVolumeNode,
                 np,
             )
+            medianCTValueText = ctValueTexts["median"]
+            meanCTValueText = ctValueTexts["mean"]
 
         if volumePixels == 1:
             return {
@@ -3188,6 +3208,7 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
                 "lengthPixels": 1,
                 "lengthMmText": self.singleVoxelLengthMmText(referenceVolumeNode),
                 "medianCTValueText": medianCTValueText,
+                "meanCTValueText": meanCTValueText,
             }
 
         occupiedVoxelCoordinates = np.argwhere(occupiedMask)
@@ -3203,6 +3224,7 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
             "lengthPixels": max(lengthPixels, 1),
             "lengthMmText": lengthMmText,
             "medianCTValueText": medianCTValueText,
+            "meanCTValueText": meanCTValueText,
         }
 
     def physicalVolumeMm3Text(self, volumePixels, volumeNode):
@@ -3245,16 +3267,16 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
             logging.debug("Could not read source volume spacing", exc_info=True)
             return None
 
-    def segmentMedianCTValueText(
+    def segmentCTValueTexts(
         self,
         segmentationNode,
         segmentID,
         sourceVolumeNode,
         np,
     ):
-        """Return the median source CT scalar value inside one segment."""
+        """Return median and mean source CT scalar values inside one segment."""
         if not sourceVolumeNode:
-            return "not available"
+            return {"median": "not available", "mean": "not available"}
         try:
             segmentArray = self._segmentArrayInReferenceGeometry(
                 segmentationNode,
@@ -3266,15 +3288,18 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
                 logging.debug(
                     "Segment mask shape does not match source volume shape"
                 )
-                return "not available"
+                return {"median": "not available", "mean": "not available"}
             segmentMask = segmentArray != 0
             if not np.any(segmentMask):
-                return "not available"
-            medianValue = np.median(sourceArray[segmentMask])
-            return self.formatScalarValue(medianValue)
+                return {"median": "not available", "mean": "not available"}
+            segmentValues = sourceArray[segmentMask]
+            return {
+                "median": self.formatScalarValue(np.median(segmentValues)),
+                "mean": self.formatScalarValue(np.mean(segmentValues)),
+            }
         except Exception:
-            logging.debug("Could not calculate median CT value", exc_info=True)
-            return "not available"
+            logging.debug("Could not calculate CT values", exc_info=True)
+            return {"median": "not available", "mean": "not available"}
 
     def formatScalarValue(self, value):
         """Format a CT scalar value like Slicer's Data Probe display."""

@@ -68,7 +68,7 @@ GRID_VERTICAL_SPACING = 4
 
 
 class MucusPlugNavigator(ScriptedLoadableModule):
-    """Navigate, inspect, edit, delete, measure, export, and count mucus plugs."""
+    """Review, navigate, edit, measure, and export candidate segments."""
 
     def __init__(self, parent):
         """Initialize the scripted module metadata shown by 3D Slicer."""
@@ -76,11 +76,11 @@ class MucusPlugNavigator(ScriptedLoadableModule):
         self.parent.title = "Mucus Plug Navigator"
         self.parent.categories = ["Segmentation"]
         self.parent.dependencies = ["SegmentEditor"]
-        self.parent.contributors = ["Codex"]
         self.parent.helpText = """
-Use the standard Segment Editor tools while adding mucus-plug navigation controls.
-Select an existing mucus segmentation and CT source volume, then use Jump, Next,
-and Delete to inspect existing segments. Each segment is treated as one mucus plug.
+Use the standard Segment Editor infrastructure with candidate-review controls.
+Select an existing segmentation and its source CT volume, then use the navigation,
+editing, measurement, and export tools. Each active segment is treated as one
+candidate segment; the module does not classify or clinically confirm mucus plugs.
 """
         self.parent.acknowledgementText = """
 This module embeds Slicer's qMRMLSegmentEditorWidget and adds navigation controls.
@@ -236,13 +236,21 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
         self.segmentationSelector = self._createNodeSelector(
             ["vtkMRMLSegmentationNode"],
-            "Select the mucus segmentation. Each segment is treated as one mucus plug.",
+            (
+                "Select the candidate segmentation. Each active segment is counted "
+                "as one candidate segment."
+            ),
         )
         selectorsLayout.addRow("Segmentation:", self.segmentationSelector)
 
         self.sourceVolumeSelector = self._createNodeSelector(
             ["vtkMRMLScalarVolumeNode"],
-            "Select the CT source volume used by Segment Editor.",
+            (
+                "Select the source CT volume used for display, reference geometry, "
+                "physical measurements, and source-intensity sampling. Scalar "
+                "values are used as stored; the module does not validate modality "
+                "or Hounsfield-unit calibration."
+            ),
         )
         selectorsLayout.addRow("Source volume:", self.sourceVolumeSelector)
 
@@ -255,8 +263,12 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         controlsFrame.setLayout(controlsLayout)
         self._configureGridLayout(controlsLayout)
 
-        self.countLabel = qt.QLabel("Mucus plug count: 0")
+        self.countLabel = qt.QLabel("Active candidate count: 0")
         self.countLabel.setMinimumWidth(150)
+        self.countLabel.setToolTip(
+            "Number of active segments in the selected segmentation. "
+            "This is not a clinical mucus-plug count."
+        )
         controlsLayout.addWidget(self.countLabel, 0, 0)
 
         self.volumeLabel = qt.QLabel("Volume: - voxels")
@@ -265,10 +277,10 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.lengthLabel = qt.QLabel("Length: - voxels")
         controlsLayout.addWidget(self.lengthLabel, 0, 2)
 
-        self.ctValueLabel = qt.QLabel("Median CT: -")
+        self.ctValueLabel = qt.QLabel("Median intensity: -")
         controlsLayout.addWidget(self.ctValueLabel, 0, 3)
 
-        self.meanCtValueLabel = qt.QLabel("Mean CT: -")
+        self.meanCtValueLabel = qt.QLabel("Mean intensity: -")
         controlsLayout.addWidget(self.meanCtValueLabel, 0, 4)
 
         self.spacingLabel = qt.QLabel("Voxel spacing: -")
@@ -293,7 +305,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
         self.jumpButton = self._createButton(
             "Jump",
-            "Jump slice views to the currently selected mucus plug.",
+            "Jump slice views to the currently selected candidate segment.",
         )
         controlsLayout.addWidget(self.jumpButton, 1, 2)
         self._hideBackupJumpButton()
@@ -340,13 +352,13 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
         self.deleteButton = self._createButton(
             "Delete",
-            "Delete only the currently selected mucus plug segment.",
+            "Move only the currently selected candidate segment to the recoverable backup.",
         )
         segmentToolbarLayout.addWidget(self.deleteButton, 0, 3)
 
         self.measureButton = self._createButton(
             "Measure",
-            "Calculate volume and length for the currently selected mucus plug.",
+            "Calculate measurements for the currently selected candidate segment.",
         )
         segmentToolbarLayout.addWidget(self.measureButton, 0, 4)
 
@@ -370,13 +382,13 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
         self.exportButton = self._createButton(
             "Export",
-            "Export mucus plug measurements and source spacing to a CSV file.",
+            "Export active candidate measurements and source spacing to a CSV file.",
         )
         segmentToolbarLayout.addWidget(self.exportButton, 1, 3)
 
         self.restoreButton = self._createButton(
             "Restore",
-            "Choose logically deleted mucus plug segments to show again.",
+            "Choose candidate segments from the recoverable backup to restore.",
         )
         segmentToolbarLayout.addWidget(self.restoreButton, 1, 4)
 
@@ -578,7 +590,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         return ""
 
     def _navigationShortcutBlockingReason(self):
-        """Return a short user-facing reason when arrow keys cannot navigate mucus plugs."""
+        """Return a short reason when arrow keys cannot navigate candidates."""
         if not self._isModuleActiveForShortcut():
             return "Arrow shortcut ignored because Mucus Plug Navigator is not active."
         if self._focusWidgetAcceptsTypedShortcut():
@@ -586,7 +598,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         if not self.segmentationNode():
             return "Arrow shortcut cannot navigate: no segmentation is selected."
         if self.logic.activeSegmentCount(self.segmentationNode()) == 0:
-            return "Arrow shortcut cannot navigate: no mucus plug segments are available."
+            return "Arrow shortcut cannot navigate: no active candidate segments are available."
         return ""
 
     def _isModuleActiveForShortcut(self):
@@ -1173,7 +1185,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             return
         if self.logic.isLogicallyDeletedSegment(segmentationNode, segmentID):
             self._showShortcutMessage(
-                "This mucus plug segment is already logically deleted."
+                "This candidate segment is already in the recoverable backup."
             )
             return
 
@@ -1181,9 +1193,9 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         segmentName = segment.GetName() if segment else segmentID
         answer = qt.QMessageBox.question(
             slicer.util.mainWindow(),
-            "Delete mucus plug segment",
+            "Remove candidate segment from active review",
             (
-                "Move this mucus plug segment to the deleted list?\n"
+                "Move this candidate segment to the recoverable backup?\n"
                 "It will disappear from the segment table, but you can restore it later."
                 "\n\n{}".format(segmentName)
             ),
@@ -1216,7 +1228,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         segmentationNode = self.segmentationNode()
         deletedSegmentIDs = self.logic.logicallyDeletedSegmentIDs(segmentationNode)
         if not deletedSegmentIDs:
-            self._showShortcutMessage("No logically deleted mucus plug segments to restore.")
+            self._showShortcutMessage("No candidate segments are available to restore.")
             return
 
         selectedSegmentIDs = self._promptForDeletedSegmentsToRestore(
@@ -1226,7 +1238,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         if selectedSegmentIDs is None:
             return
         if not selectedSegmentIDs:
-            self._showShortcutMessage("No mucus plug segments were selected to restore.")
+            self._showShortcutMessage("No candidate segments were selected to restore.")
             return
 
         restoredSegmentIDs = self.logic.restoreLogicallyDeletedSegments(
@@ -1235,7 +1247,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         )
         self.updateSegmentCountAndButtons()
         if not restoredSegmentIDs:
-            self._showShortcutMessage("No selected mucus plug segments could be restored.")
+            self._showShortcutMessage("No selected candidate segments could be restored.")
             return
 
         firstRestoredSegmentID = restoredSegmentIDs[0]
@@ -1251,7 +1263,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             labelRefreshReason="Restore button all-view check",
         )
         self._showShortcutMessage(
-            "Restored {} logically deleted mucus plug segment(s).".format(
+            "Restored {} candidate segment(s).".format(
                 len(restoredSegmentIDs)
             )
         )
@@ -1259,11 +1271,11 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
     def _promptForDeletedSegmentsToRestore(self, segmentationNode, deletedSegmentIDs):
         """Ask the user which logically deleted segment IDs should be restored."""
         dialog = qt.QDialog(slicer.util.mainWindow())
-        dialog.setWindowTitle("Restore mucus plug segments")
+        dialog.setWindowTitle("Restore candidate segments")
 
         layout = qt.QVBoxLayout()
         dialog.setLayout(layout)
-        layout.addWidget(qt.QLabel("Select mucus plug segment(s) to restore:"))
+        layout.addWidget(qt.QLabel("Select candidate segment(s) to restore:"))
 
         listWidget = qt.QListWidget()
         listWidget.setSelectionMode(qt.QAbstractItemView.ExtendedSelection)
@@ -1318,10 +1330,16 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             self.resetCurrentSegmentMeasurements()
             return
 
+        sourceVolumeError = self.logic.sourceVolumeInputError(self.sourceVolumeNode())
+        if sourceVolumeError:
+            self.resetCurrentSegmentMeasurements()
+            slicer.util.warningDisplay(sourceVolumeError)
+            return
+
         self.volumeLabel.setText("Volume: calculating...")
         self.lengthLabel.setText("Length: calculating...")
-        self.ctValueLabel.setText("Median CT: calculating...")
-        self.meanCtValueLabel.setText("Mean CT: calculating...")
+        self.ctValueLabel.setText("Median intensity: calculating...")
+        self.meanCtValueLabel.setText("Mean intensity: calculating...")
         slicer.app.processEvents()
 
         metrics = self.logic.segmentVoxelMetrics(
@@ -1333,8 +1351,8 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         if not metrics:
             self.volumeLabel.setText("Volume: failed")
             self.lengthLabel.setText("Length: failed")
-            self.ctValueLabel.setText("Median CT: failed")
-            self.meanCtValueLabel.setText("Mean CT: failed")
+            self.ctValueLabel.setText("Median intensity: failed")
+            self.meanCtValueLabel.setText("Mean intensity: failed")
             return
 
         self.volumeLabel.setText(
@@ -1350,10 +1368,10 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             )
         )
         self.ctValueLabel.setText(
-            "Median CT: {}".format(metrics["medianCTValueText"])
+            "Median intensity: {}".format(metrics["medianCTValueText"])
         )
         self.meanCtValueLabel.setText(
-            "Mean CT: {}".format(metrics["meanCTValueText"])
+            "Mean intensity: {}".format(metrics["meanCTValueText"])
         )
 
     def onNoEditingButton(self, checked=False):
@@ -1373,7 +1391,12 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         segmentationNode = self.segmentationNode()
         segmentIDs = self.logic.activeSegmentIDs(segmentationNode)
         if not segmentIDs:
-            slicer.util.warningDisplay("No mucus plug segments to export.")
+            slicer.util.warningDisplay("No active candidate segments are available to export.")
+            return
+
+        sourceVolumeError = self.logic.sourceVolumeInputError(self.sourceVolumeNode())
+        if sourceVolumeError:
+            slicer.util.warningDisplay(sourceVolumeError)
             return
 
         filePath = self._promptForExportPath(segmentationNode.GetName())
@@ -1386,7 +1409,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
                 filePath,
                 segmentationNode,
             )
-            message = "Exported {} mucus plug measurements to:\n{}".format(
+            message = "Exported {} candidate measurements to:\n{}".format(
                 exportedCount,
                 filePath,
             )
@@ -1394,12 +1417,12 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
                 message += "\n\nSkipped {} large mask-like segment(s).".format(skippedCount)
             slicer.util.infoDisplay(message)
         except Exception as exc:
-            logging.exception("Failed to export mucus plug measurements")
+            logging.exception("Failed to export candidate measurements")
             if self._isPermissionDeniedError(exc):
                 self._showExportPermissionError(filePath)
             else:
                 slicer.util.errorDisplay(
-                    "Failed to export mucus plug measurements:\n{}".format(exc)
+                    "Failed to export candidate measurements:\n{}".format(exc)
                 )
         finally:
             self._setExportInProgress(False)
@@ -1424,10 +1447,10 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
     def _promptForExportPath(self, segmentationName):
         """Ask the user where to save the CSV file and normalize the file extension."""
-        defaultFileName = "{}_mucus_plugs.csv".format(segmentationName)
+        defaultFileName = "{}_candidate_measurements.csv".format(segmentationName)
         filePath = qt.QFileDialog.getSaveFileName(
             slicer.util.mainWindow(),
-            "Export mucus plug measurements",
+            "Export candidate measurements",
             defaultFileName,
             "CSV files (*.csv)",
         )
@@ -1459,7 +1482,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         )
         with open(filePath, "w", newline="") as csvFile:
             writer = csv.writer(csvFile)
-            writer.writerow(["Mucus plug count", len(rows)])
+            writer.writerow(["Exported candidate count", len(rows)])
             writer.writerow(
                 ["Source voxel spacing (mm)"]
                 + self.logic.volumeSpacingTextValues(sourceVolumeNode)
@@ -1472,8 +1495,8 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
                     "Volume (mm3)",
                     "Length (voxels)",
                     "Length (mm)",
-                    "Median CT",
-                    "Mean CT",
+                    "Median source intensity",
+                    "Mean source intensity",
                 ]
             )
             for row in rows:
@@ -1726,7 +1749,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         return labelNode
 
     def _showSingleSegmentNameLabel(self, segmentationNode, segmentID):
-        """Show one segment label near the mucus plug without covering it."""
+        """Show one label near a candidate segment without covering it."""
         labelPositionRAS = self.logic.segmentLabelPositionRAS(
             segmentationNode,
             segmentID,
@@ -1967,7 +1990,7 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         segmentationNode = self.segmentationNode()
         count = self.logic.activeSegmentCount(segmentationNode)
         deletedCount = self.logic.logicallyDeletedSegmentCount(segmentationNode)
-        self.countLabel.setText("Mucus plug count: {}".format(count))
+        self.countLabel.setText("Active candidate count: {}".format(count))
 
         hasSegments = count > 0
         hasCurrentSegment = self.logic.isActiveSegmentID(
@@ -1975,6 +1998,9 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             self.currentSegmentID(),
         )
         hasSegmentation = segmentationNode is not None
+        hasSourceVolume = not self.logic.sourceVolumeInputError(
+            self.sourceVolumeNode()
+        )
 
         self.addButton.enabled = hasSegmentation
         self.show3DButton.enabled = hasSegmentation
@@ -1985,11 +2011,11 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.jumpButton.enabled = hasSegments
         self.lastButton.enabled = hasSegments
         self.nextButton.enabled = hasSegments
-        self.exportButton.enabled = hasSegments
+        self.exportButton.enabled = hasSegments and hasSourceVolume
         self.restoreButton.enabled = deletedCount > 0
 
         self.deleteButton.enabled = hasCurrentSegment
-        self.measureButton.enabled = hasCurrentSegment
+        self.measureButton.enabled = hasCurrentSegment and hasSourceVolume
         self.paintButton.enabled = hasCurrentSegment
         self.eraseButton.enabled = hasCurrentSegment
 
@@ -1997,8 +2023,8 @@ class MucusPlugNavigatorWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         """Clear stale measurement labels for the current segment."""
         self.volumeLabel.setText("Volume: not calculated")
         self.lengthLabel.setText("Length: not calculated")
-        self.ctValueLabel.setText("Median CT: not calculated")
-        self.meanCtValueLabel.setText("Mean CT: not calculated")
+        self.ctValueLabel.setText("Median intensity: not calculated")
+        self.meanCtValueLabel.setText("Mean intensity: not calculated")
 
     def updateSourceVoxelSpacing(self):
         """Show selected source CT voxel spacing in millimeters."""
@@ -2523,7 +2549,7 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
         ]
 
     def segmentCount(self, segmentationNode):
-        """Return the number of mucus plug segments in the selected segmentation."""
+        """Return the number of segments in the selected segmentation."""
         return len(self.segmentIDs(segmentationNode))
 
     def markSegmentDone(self, segmentationNode, segmentID):
@@ -2611,7 +2637,7 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
         return self.segmentIDs(segmentationNode)
 
     def activeSegmentCount(self, segmentationNode):
-        """Return the number of segments currently treated as active mucus plugs."""
+        """Return the number of segments currently included in active review."""
         return len(self.activeSegmentIDs(segmentationNode))
 
     def logicallyDeletedSegmentIDs(self, segmentationNode):
@@ -3142,20 +3168,40 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
         skipLengthAbovePixels=None,
         includeMedianCTValue=False,
     ):
-        """Calculate voxel count and main-axis pixel length for one segment."""
+        """Calculate one segment's metrics in the selected reference geometry."""
         if not self.isValidSegmentID(segmentationNode, segmentID):
             return None
 
         try:
             import numpy as np
 
-            segmentArray = self._segmentArray(
+            segmentArray = self._segmentArrayInReferenceGeometry(
                 segmentationNode,
                 segmentID,
                 referenceVolumeNode,
             )
+            if referenceVolumeNode:
+                sourceArray = slicer.util.arrayFromVolume(referenceVolumeNode)
+                if segmentArray.shape != sourceArray.shape:
+                    raise ValueError(
+                        "Candidate mask shape does not match the source-volume array."
+                    )
             occupiedMask = segmentArray != 0
             volumePixels = int(np.count_nonzero(occupiedMask))
+            if volumePixels == 0 and referenceVolumeNode:
+                originalArray = self._segmentArray(
+                    segmentationNode,
+                    segmentID,
+                    None,
+                )
+                if int(np.count_nonzero(originalArray)) > 0:
+                    logging.warning(
+                        "Candidate segment '%s' has no voxels in the selected "
+                        "source-volume geometry. Check that both inputs belong "
+                        "to the same case.",
+                        segmentID,
+                    )
+                    return None
             volumeMm3Text = self.physicalVolumeMm3Text(
                 volumePixels,
                 referenceVolumeNode,
@@ -3267,6 +3313,26 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
             logging.debug("Could not read source volume spacing", exc_info=True)
             return None
 
+    def sourceVolumeInputError(self, volumeNode):
+        """Return a user-facing error when a source volume cannot be measured."""
+        if not volumeNode:
+            return "Select a source CT volume before measuring or exporting."
+        try:
+            imageData = volumeNode.GetImageData()
+        except Exception:
+            imageData = None
+        if not imageData:
+            return "The selected source volume does not contain image data."
+        try:
+            dimensions = imageData.GetDimensions()
+            scalars = imageData.GetPointData().GetScalars()
+        except Exception:
+            dimensions = None
+            scalars = None
+        if not dimensions or min(dimensions) <= 0 or scalars is None:
+            return "The selected source volume does not contain usable scalar data."
+        return ""
+
     def segmentCTValueTexts(
         self,
         segmentationNode,
@@ -3274,7 +3340,7 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
         sourceVolumeNode,
         np,
     ):
-        """Return median and mean source CT scalar values inside one segment."""
+        """Return median and mean source-volume intensities inside one segment."""
         if not sourceVolumeNode:
             return {"median": "not available", "mean": "not available"}
         try:
@@ -3298,11 +3364,11 @@ class MucusPlugNavigatorLogic(ScriptedLoadableModuleLogic):
                 "mean": self.formatScalarValue(np.mean(segmentValues)),
             }
         except Exception:
-            logging.debug("Could not calculate CT values", exc_info=True)
+            logging.debug("Could not calculate source-volume intensities", exc_info=True)
             return {"median": "not available", "mean": "not available"}
 
     def formatScalarValue(self, value):
-        """Format a CT scalar value like Slicer's Data Probe display."""
+        """Format a source-volume scalar value like Slicer's Data Probe display."""
         roundedValue = round(float(value))
         if abs(float(value) - roundedValue) < 1e-6:
             return str(int(roundedValue))
@@ -4285,8 +4351,26 @@ class MucusPlugNavigatorTest(ScriptedLoadableModuleTest):
         self.test_MucusPlugNavigatorLogic()
 
     def test_MucusPlugNavigatorLogic(self):
-        """Verify that logic helper methods handle empty inputs."""
+        """Verify empty inputs and source-volume validation helpers."""
         logic = MucusPlugNavigatorLogic()
         self.assertEqual(logic.segmentCount(None), 0)
         self.assertEqual(logic.nextSegmentID(None, ""), "")
         self.assertEqual(logic.previousSegmentID(None, ""), "")
+        self.assertEqual(
+            logic.sourceVolumeInputError(None),
+            "Select a source CT volume before measuring or exporting.",
+        )
+
+        emptyVolumeNode = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLScalarVolumeNode"
+        )
+        self.assertEqual(
+            logic.sourceVolumeInputError(emptyVolumeNode),
+            "The selected source volume does not contain image data.",
+        )
+
+        imageData = vtk.vtkImageData()
+        imageData.SetDimensions(2, 2, 2)
+        imageData.AllocateScalars(vtk.VTK_SHORT, 1)
+        emptyVolumeNode.SetAndObserveImageData(imageData)
+        self.assertEqual(logic.sourceVolumeInputError(emptyVolumeNode), "")
